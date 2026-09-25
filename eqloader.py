@@ -1747,6 +1747,63 @@ class EqLoaderGUI(tk.Tk):
 
         self._draw_response_graph()
 
+    @staticmethod
+    def _biquad_response_db(freqs, freq0, gain_db, q, ftype, fs=96000):
+        q = max(q, 0.001)
+        w0 = 2 * np.pi * freq0 / fs
+        A = 10 ** (gain_db / 40)
+        alpha = np.sin(w0) / (2 * q)
+        cw = np.cos(w0)
+
+        if ftype == "PK":
+            b0 = 1 + alpha * A
+            b1 = -2 * cw
+            b2 = 1 - alpha * A
+            a0 = 1 + alpha / A
+            a1 = -2 * cw
+            a2 = 1 - alpha / A
+        elif ftype == "LSQ":
+            sqA = np.sqrt(A)
+            b0 = A * ((A + 1) - (A - 1) * cw + 2 * sqA * alpha)
+            b1 = 2 * A * ((A - 1) - (A + 1) * cw)
+            b2 = A * ((A + 1) - (A - 1) * cw - 2 * sqA * alpha)
+            a0 = (A + 1) + (A - 1) * cw + 2 * sqA * alpha
+            a1 = -2 * ((A - 1) + (A + 1) * cw)
+            a2 = (A + 1) + (A - 1) * cw - 2 * sqA * alpha
+        elif ftype == "HSQ":
+            sqA = np.sqrt(A)
+            b0 = A * ((A + 1) + (A - 1) * cw + 2 * sqA * alpha)
+            b1 = -2 * A * ((A - 1) + (A + 1) * cw)
+            b2 = A * ((A + 1) + (A - 1) * cw - 2 * sqA * alpha)
+            a0 = (A + 1) - (A - 1) * cw + 2 * sqA * alpha
+            a1 = 2 * ((A - 1) - (A + 1) * cw)
+            a2 = (A + 1) - (A - 1) * cw - 2 * sqA * alpha
+        elif ftype == "HP":
+            b0 = (1 + cw) / 2
+            b1 = -(1 + cw)
+            b2 = (1 + cw) / 2
+            a0 = 1 + alpha
+            a1 = -2 * cw
+            a2 = 1 - alpha
+        elif ftype == "LP":
+            b0 = (1 - cw) / 2
+            b1 = 1 - cw
+            b2 = (1 - cw) / 2
+            a0 = 1 + alpha
+            a1 = -2 * cw
+            a2 = 1 - alpha
+        else:
+            return np.zeros_like(freqs)
+
+        b0 /= a0; b1 /= a0; b2 /= a0
+        a1 /= a0; a2 /= a0
+
+        w = 2 * np.pi * freqs / fs
+        ejw_n1 = np.exp(-1j * w)
+        ejw_n2 = np.exp(-2j * w)
+        H = (b0 + b1 * ejw_n1 + b2 * ejw_n2) / (1 + a1 * ejw_n1 + a2 * ejw_n2)
+        return 20 * np.log10(np.abs(H) + 1e-12)
+
     def _draw_response_graph(self):
 
         self.ax.clear()
@@ -1757,53 +1814,26 @@ class EqLoaderGUI(tk.Tk):
             1000
         )
 
-        response = np.zeros_like(freqs)
+        response = np.zeros(len(freqs))
 
-        for index, f in enumerate(
-            self.create_filters
-        ):
+        for index, f in enumerate(self.create_filters):
 
             try:
-                center_freq = float(
-                    f["freq"]
-                )
-
-                gain = float(
-                    f["gain"]
-                )
-
-                q = max(
-                    float(f["q"]),
-                    0.01
-                )
-
+                center_freq = float(f["freq"])
+                gain = float(f["gain"])
+                q = max(float(f["q"]), 0.01)
             except (ValueError, TypeError):
                 continue
 
             if center_freq <= 0:
                 continue
 
-            center = np.log10(
-                center_freq
-            )
-
-            width = 1.0 / q
-
-            response += (
-                gain
-                * np.exp(
-                    -(
-                        (
-                            np.log10(freqs)
-                            - center
-                        ) ** 2
-                    )
-                    /
-                    (
-                        2
-                        * (width / 8) ** 2
-                    )
-                )
+            response += self._biquad_response_db(
+                freqs,
+                center_freq,
+                gain,
+                q,
+                f.get("type", "PK"),
             )
 
             color = (
@@ -1817,54 +1847,18 @@ class EqLoaderGUI(tk.Tk):
                 [gain],
                 marker="o",
                 markersize=8,
-                color=color
+                color=color,
             )
 
-        self.ax.plot(
-            freqs,
-            response,
-            linewidth=2,
-            color="tab:blue"
-        )
-
-        self.ax.axhline(
-            0,
-            color="gray",
-            linewidth=0.8
-        )
-
-        self.ax.set_xscale(
-            "log"
-        )
-
-        self.ax.set_xlim(
-            20,
-            20000
-        )
-
-        self.ax.set_ylim(
-            -15,
-            15
-        )
-
-        self.ax.grid(
-            True,
-            which="both",
-            alpha=0.3
-        )
-
-        self.ax.set_title(
-            "EQ Response Preview"
-        )
-
-        self.ax.set_xlabel(
-            "Frequency (Hz)"
-        )
-
-        self.ax.set_ylabel(
-            "Gain (dB)"
-        )
-
+        self.ax.plot(freqs, response, linewidth=2, color="tab:blue")
+        self.ax.axhline(0, color="gray", linewidth=0.8)
+        self.ax.set_xscale("log")
+        self.ax.set_xlim(20, 20000)
+        self.ax.set_ylim(-15, 15)
+        self.ax.grid(True, which="both", alpha=0.3)
+        self.ax.set_title("EQ Response Preview")
+        self.ax.set_xlabel("Frequency (Hz)")
+        self.ax.set_ylabel("Gain (dB)")
         self.canvas_graph.draw_idle()
 
     def _create_add_band(self):
