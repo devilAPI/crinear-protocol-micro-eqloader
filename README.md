@@ -5,8 +5,7 @@ This already works on my Crinear Protocol Micro and it uses the same .txt EQ for
 
 Maybe this will be ported to other platforms. I have plans for a lightweight GUI definetly. Currently it only features loading and pulling.
 
-eqloader.py
-==============
+## eqloader.py
 
 Requires:
     pip install hidapi
