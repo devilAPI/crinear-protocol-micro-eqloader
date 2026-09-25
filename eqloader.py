@@ -2183,9 +2183,13 @@ class EqLoaderGUI(tk.Tk):
             self.q_var.set(f"{bw:.3f}")
             self.q_label.config(text="Bandwidth (oct)")
         else:
-            q = 1 / (
-                2 * math.sinh(val * math.log(2) / 2)
-            )
+            try:
+                q = 1 / (
+                    2 * math.sinh(val * math.log(2) / 2)
+                )
+            except OverflowError:
+                self.q_label.config(text="Q")
+                return
             self.q_var.set(f"{q:.3f}")
             self.q_label.config(text="Q")
 
