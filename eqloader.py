@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import copy
 import math
 import queue
 import re
@@ -836,6 +837,9 @@ class EqLoaderGUI(tk.Tk):
         ]
 
         self.selected_filter = 0
+
+        self._undo_stack = []
+        self._redo_stack = []
 
         self._build_widgets()
 
@@ -1745,6 +1749,9 @@ class EqLoaderGUI(tk.Tk):
         # Initial state
         # --------------------------------------------------------------
 
+        self.bind("<Control-z>", self._undo)
+        self.bind("<Control-y>", self._redo)
+
         self._refresh_create_tab()
 
         self._refresh_devices()
@@ -1916,6 +1923,7 @@ class EqLoaderGUI(tk.Tk):
 
     def _create_add_band(self):
 
+        self._snapshot()
         self.create_filters.append({
             "type": "PK",
             "freq": 1000.0,
@@ -1940,6 +1948,7 @@ class EqLoaderGUI(tk.Tk):
 
         index = sel[0]
 
+        self._snapshot()
         del self.create_filters[index]
 
         if not self.create_filters:
@@ -1963,6 +1972,7 @@ class EqLoaderGUI(tk.Tk):
         ):
             return
 
+        self._snapshot()
         self.create_filters.clear()
 
         self.selected_filter = -1
@@ -1999,7 +2009,7 @@ class EqLoaderGUI(tk.Tk):
                 dev.close()
 
             def apply():
-
+                self._snapshot()
                 self.create_filters = [
                     {
                         "type": f.get("type", "PK"),
@@ -2156,6 +2166,7 @@ class EqLoaderGUI(tk.Tk):
             self.selected_filter
         ]
 
+        self._snapshot()
         f["freq"] = freq
         f["gain"] = gain
         f["q"] = q
@@ -2193,6 +2204,56 @@ class EqLoaderGUI(tk.Tk):
             self.q_var.set(f"{q:.3f}")
             self.q_label.config(text="Q")
 
+    def _snapshot(self):
+        self._undo_stack.append((
+            copy.deepcopy(self.create_filters),
+            self.create_preamp_entry.get(),
+            self.selected_filter,
+        ))
+        self._redo_stack.clear()
+
+    def _undo(self, _event=None):
+
+        if not self._undo_stack:
+            return
+
+        self._redo_stack.append((
+            copy.deepcopy(self.create_filters),
+            self.create_preamp_entry.get(),
+            self.selected_filter,
+        ))
+
+        filters, preamp, sel = self._undo_stack.pop()
+        self.create_filters = filters
+        self.selected_filter = max(
+            -1, min(sel, len(self.create_filters) - 1)
+        )
+        self.create_preamp_entry.delete(0, "end")
+        self.create_preamp_entry.insert(0, preamp)
+        self._refresh_create_tab()
+        self._load_selected_filter_into_editor()
+
+    def _redo(self, _event=None):
+
+        if not self._redo_stack:
+            return
+
+        self._undo_stack.append((
+            copy.deepcopy(self.create_filters),
+            self.create_preamp_entry.get(),
+            self.selected_filter,
+        ))
+
+        filters, preamp, sel = self._redo_stack.pop()
+        self.create_filters = filters
+        self.selected_filter = max(
+            -1, min(sel, len(self.create_filters) - 1)
+        )
+        self.create_preamp_entry.delete(0, "end")
+        self.create_preamp_entry.insert(0, preamp)
+        self._refresh_create_tab()
+        self._load_selected_filter_into_editor()
+
     # ==================================================================
     # Mouse drag-and-drop graph controls
     # ==================================================================
@@ -2211,6 +2272,7 @@ class EqLoaderGUI(tk.Tk):
             self._on_right_click_graph(freq, gain)
             return
 
+        self._snapshot()
         if not hasattr(self, "_dragging_point_idx"):
             self._dragging_point_idx = None
 
@@ -2299,6 +2361,7 @@ class EqLoaderGUI(tk.Tk):
         ):
             return
 
+        self._snapshot()
         del self.create_filters[closest_idx]
 
         if not self.create_filters:
@@ -2431,6 +2494,7 @@ class EqLoaderGUI(tk.Tk):
             messagebox.showerror("Load Error", str(e))
             return
 
+        self._snapshot()
         self.create_filters = [
             dict(f) for f in data["filters"]
         ]
