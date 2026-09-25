@@ -1381,10 +1381,12 @@ class EqLoaderGUI(tk.Tk):
             pady=4
         )
 
-        ttk.Label(
+        self.q_label = ttk.Label(
             edit,
             text="Q"
-        ).grid(
+        )
+
+        self.q_label.grid(
             row=2,
             column=0,
             sticky="w",
@@ -1443,6 +1445,22 @@ class EqLoaderGUI(tk.Tk):
             pady=4
         )
 
+        self.bw_mode = tk.BooleanVar(value=False)
+
+        ttk.Checkbutton(
+            edit,
+            text="Show as Bandwidth (oct)",
+            variable=self.bw_mode,
+            command=self._toggle_bw_mode,
+        ).grid(
+            row=4,
+            column=0,
+            columnspan=2,
+            sticky="w",
+            padx=5,
+            pady=2,
+        )
+
         # --------------------------------------------------------------
         # Editor buttons
         # --------------------------------------------------------------
@@ -1450,7 +1468,7 @@ class EqLoaderGUI(tk.Tk):
         button_frame = ttk.Frame(edit)
 
         button_frame.grid(
-            row=4,
+            row=5,
             column=0,
             columnspan=3,
             sticky="w",
@@ -2015,9 +2033,16 @@ class EqLoaderGUI(tk.Tk):
             str(f["gain"])
         )
 
-        self.q_var.set(
-            str(f["q"])
-        )
+        q_val = float(f["q"])
+
+        if self.bw_mode.get():
+            bw = (
+                2 * math.asinh(1 / (2 * max(q_val, 0.001)))
+                / math.log(2)
+            )
+            self.q_var.set(f"{bw:.3f}")
+        else:
+            self.q_var.set(str(f["q"]))
 
         self.type_var.set(
             f["type"]
@@ -2060,6 +2085,15 @@ class EqLoaderGUI(tk.Tk):
                     "Q is invalid."
                 )
 
+            if self.bw_mode.get():
+                if q <= 0:
+                    raise ValueError(
+                        "Bandwidth must be greater than 0."
+                    )
+                q = 1 / (
+                    2 * math.sinh(q * math.log(2) / 2)
+                )
+
             if freq <= 0:
                 raise ValueError(
                     "Frequency must be greater than 0."
@@ -2094,6 +2128,32 @@ class EqLoaderGUI(tk.Tk):
         f["type"] = self.type_var.get()
 
         self._refresh_create_tab()
+
+    def _toggle_bw_mode(self):
+
+        val = self._parse_float(self.q_var.get())
+
+        if val is None or val <= 0:
+            self.q_label.config(
+                text="Bandwidth (oct)"
+                if self.bw_mode.get()
+                else "Q"
+            )
+            return
+
+        if self.bw_mode.get():
+            bw = (
+                2 * math.asinh(1 / (2 * val))
+                / math.log(2)
+            )
+            self.q_var.set(f"{bw:.3f}")
+            self.q_label.config(text="Bandwidth (oct)")
+        else:
+            q = 1 / (
+                2 * math.sinh(val * math.log(2) / 2)
+            )
+            self.q_var.set(f"{q:.3f}")
+            self.q_label.config(text="Q")
 
     # ==================================================================
     # Mouse drag-and-drop graph controls
