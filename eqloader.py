@@ -2191,7 +2191,7 @@ class EqLoaderGUI(tk.Tk):
         if not messagebox.askyesno(
             "Delete Band",
             f"Delete band {closest_idx + 1} "
-            f"({f['freq']:.1f} Hz)?"
+            f"({float(f['freq']):.1f} Hz)?"
         ):
             return
 
