@@ -2103,6 +2103,10 @@ class EqLoaderGUI(tk.Tk):
         if freq < 20 or freq > 20000:
             return
 
+        if event.button == 3:
+            self._on_right_click_graph(freq, gain)
+            return
+
         if not hasattr(self, "_dragging_point_idx"):
             self._dragging_point_idx = None
 
@@ -2156,6 +2160,53 @@ class EqLoaderGUI(tk.Tk):
         if getattr(self, "_dragging_point_idx", None) is not None:
             self._dragging_point_idx = None
             self._refresh_create_tab()
+
+    def _on_right_click_graph(self, freq, gain):
+
+        if not self.create_filters:
+            return
+
+        click_x_log = math.log10(freq)
+        closest_idx = -1
+        min_dist = float('inf')
+
+        for i, f in enumerate(self.create_filters):
+            px = f.get("freq", 0)
+            py = f.get("gain", 0)
+            if px <= 0:
+                continue
+            dist = math.hypot(
+                (math.log10(px) - click_x_log) * 10,
+                py - gain,
+            )
+            if dist < min_dist:
+                min_dist = dist
+                closest_idx = i
+
+        if min_dist >= 2.0 or closest_idx < 0:
+            return
+
+        f = self.create_filters[closest_idx]
+
+        if not messagebox.askyesno(
+            "Delete Band",
+            f"Delete band {closest_idx + 1} "
+            f"({f['freq']:.1f} Hz)?"
+        ):
+            return
+
+        del self.create_filters[closest_idx]
+
+        if not self.create_filters:
+            self.selected_filter = -1
+        else:
+            self.selected_filter = min(
+                closest_idx,
+                len(self.create_filters) - 1,
+            )
+
+        self._refresh_create_tab()
+        self._load_selected_filter_into_editor()
 
     def _create_push(self):
 
