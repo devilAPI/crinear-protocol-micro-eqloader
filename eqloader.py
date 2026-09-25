@@ -481,6 +481,20 @@ def read_global_gain(dev):
     return signed
 
 
+def is_filter_disabled(ftype, freq, gain, q):
+    """Return True when the device treats this band as OFF.
+
+    The device stores an off band as an inert flat filter
+    (INERT_FILTER: PK, Fc 100, Gain 0, Q 1), so a peaking/shelf band with
+    zero gain is audibly inert and must be treated as off. LP/HP filters
+    shape the signal regardless of gain, so only a fully-zero slot counts.
+    """
+    if ftype in ("PK", "LSQ", "HSQ"):
+        return gain == 0
+
+    return not (freq or q or gain)
+
+
 def parse_filter_packet(packet):
     filter_index = packet[4]
 
@@ -521,8 +535,8 @@ def parse_filter_packet(packet):
         "q": q,
         "gain": gain,
         "type": ftype,
-        "disabled": not (
-            freq or q or gain
+        "disabled": is_filter_disabled(
+            ftype, freq, gain, q
         ),
     }
 
@@ -739,10 +753,11 @@ def save_profile(path, global_gain, filters):
 
         disabled = f.get(
             "disabled",
-            not (
-                f["freq"]
-                or f["q"]
-                or f["gain"]
+            is_filter_disabled(
+                f.get("type", "PK"),
+                f["freq"],
+                f["gain"],
+                f["q"],
             )
         )
 
