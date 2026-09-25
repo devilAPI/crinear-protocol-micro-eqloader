@@ -2090,9 +2090,14 @@ class EqLoaderGUI(tk.Tk):
                     raise ValueError(
                         "Bandwidth must be greater than 0."
                     )
-                q = 1 / (
-                    2 * math.sinh(q * math.log(2) / 2)
-                )
+                try:
+                    q = 1 / (
+                        2 * math.sinh(q * math.log(2) / 2)
+                    )
+                except OverflowError:
+                    raise ValueError(
+                        "Bandwidth value is too large."
+                    )
 
             if freq <= 0:
                 raise ValueError(
@@ -2149,9 +2154,13 @@ class EqLoaderGUI(tk.Tk):
             self.q_var.set(f"{bw:.3f}")
             self.q_label.config(text="Bandwidth (oct)")
         else:
-            q = 1 / (
-                2 * math.sinh(val * math.log(2) / 2)
-            )
+            try:
+                q = 1 / (
+                    2 * math.sinh(val * math.log(2) / 2)
+                )
+            except OverflowError:
+                self.q_label.config(text="Q")
+                return
             self.q_var.set(f"{q:.3f}")
             self.q_label.config(text="Q")
 
