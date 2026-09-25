@@ -1751,6 +1751,7 @@ class EqLoaderGUI(tk.Tk):
 
         self.bind("<Control-z>", self._undo)
         self.bind("<Control-y>", self._redo)
+        self.bind("<Control-Shift-z>", self._redo)
 
         self._refresh_create_tab()
 
@@ -2272,7 +2273,6 @@ class EqLoaderGUI(tk.Tk):
             self._on_right_click_graph(freq, gain)
             return
 
-        self._snapshot()
         if not hasattr(self, "_dragging_point_idx"):
             self._dragging_point_idx = None
 
@@ -2296,6 +2296,7 @@ class EqLoaderGUI(tk.Tk):
             self._load_selected_filter_into_editor()
             self._draw_response_graph()
         else:
+            self._snapshot()
             self.create_filters.append({
                 "type": "PK",
                 "freq": round(freq, 1),
