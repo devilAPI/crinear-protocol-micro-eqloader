@@ -841,6 +841,9 @@ class EqLoaderGUI(tk.Tk):
         self._undo_stack = []
         self._redo_stack = []
 
+        self._dragging_point_idx = None
+        self._drag_snapshot_taken = False
+
         self._build_widgets()
 
         self._poll_log_queue()
@@ -2259,6 +2262,37 @@ class EqLoaderGUI(tk.Tk):
     # Mouse drag-and-drop graph controls
     # ==================================================================
 
+    def _find_closest_filter(self, event, max_pixels=14):
+        """Return the index of the band nearest the cursor in screen
+        pixels, or -1 if none is within ``max_pixels``."""
+
+        if event.x is None or event.y is None:
+            return -1
+
+        best_idx = -1
+        best_dist = float("inf")
+
+        for i, f in enumerate(self.create_filters):
+            try:
+                px = float(f.get("freq", 0))
+                py = float(f.get("gain", 0))
+            except (ValueError, TypeError):
+                continue
+            if px <= 0:
+                continue
+
+            try:
+                disp_x, disp_y = self.ax.transData.transform((px, py))
+            except (ValueError, TypeError):
+                continue
+
+            dist = math.hypot(disp_x - event.x, disp_y - event.y)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+
+        return best_idx if best_dist <= max_pixels else -1
+
     def _on_press(self, event):
         if event.xdata is None or event.ydata is None:
             return
@@ -2270,29 +2304,18 @@ class EqLoaderGUI(tk.Tk):
             return
 
         if event.button == 3:
-            self._on_right_click_graph(freq, gain)
+            self._on_right_click_graph(event)
             return
 
-        if not hasattr(self, "_dragging_point_idx"):
-            self._dragging_point_idx = None
+        closest_idx = self._find_closest_filter(event)
 
-        click_x_log = math.log10(freq)
-        closest_idx = -1
-        min_dist = float('inf')
-
-        for i, f in enumerate(self.create_filters):
-            px = f.get("freq", 0)
-            py = f.get("gain", 0)
-            if px <= 0:
-                continue
-            dist = math.hypot((math.log10(px) - click_x_log) * 10, py - gain)
-            if dist < min_dist:
-                min_dist = dist
-                closest_idx = i
-
-        if min_dist < 2.0:
+        if closest_idx >= 0:
+            # Grab an existing band. Don't snapshot yet: a plain click
+            # that only selects should not create an undo step. The
+            # snapshot is taken lazily on the first actual drag move.
             self.selected_filter = closest_idx
             self._dragging_point_idx = closest_idx
+            self._drag_snapshot_taken = False
             self._load_selected_filter_into_editor()
             self._draw_response_graph()
         else:
@@ -2305,17 +2328,26 @@ class EqLoaderGUI(tk.Tk):
             })
             self.selected_filter = len(self.create_filters) - 1
             self._dragging_point_idx = self.selected_filter
+            # The pre-append snapshot already covers creating and
+            # positioning this new band as a single undo step.
+            self._drag_snapshot_taken = True
             self._refresh_create_tab()
             self._load_selected_filter_into_editor()
 
     def _on_motion(self, event):
-        if getattr(self, "_dragging_point_idx", None) is None:
+        if self._dragging_point_idx is None:
             return
         if event.xdata is None or event.ydata is None:
             return
 
         freq = max(20.0, min(20000.0, float(event.xdata)))
         gain = max(-15.0, min(15.0, float(event.ydata)))
+
+        # Record the pre-drag state once, so the whole drag is a single
+        # undoable step.
+        if not self._drag_snapshot_taken:
+            self._snapshot()
+            self._drag_snapshot_taken = True
 
         self.create_filters[self._dragging_point_idx]["freq"] = round(freq, 1)
         self.create_filters[self._dragging_point_idx]["gain"] = round(gain, 1)
@@ -2324,33 +2356,19 @@ class EqLoaderGUI(tk.Tk):
         self._draw_response_graph()
 
     def _on_release(self, event):
-        if getattr(self, "_dragging_point_idx", None) is not None:
+        if self._dragging_point_idx is not None:
             self._dragging_point_idx = None
+            self._drag_snapshot_taken = False
             self._refresh_create_tab()
 
-    def _on_right_click_graph(self, freq, gain):
+    def _on_right_click_graph(self, event):
 
         if not self.create_filters:
             return
 
-        click_x_log = math.log10(freq)
-        closest_idx = -1
-        min_dist = float('inf')
+        closest_idx = self._find_closest_filter(event)
 
-        for i, f in enumerate(self.create_filters):
-            px = f.get("freq", 0)
-            py = f.get("gain", 0)
-            if px <= 0:
-                continue
-            dist = math.hypot(
-                (math.log10(px) - click_x_log) * 10,
-                py - gain,
-            )
-            if dist < min_dist:
-                min_dist = dist
-                closest_idx = i
-
-        if min_dist >= 2.0 or closest_idx < 0:
+        if closest_idx < 0:
             return
 
         f = self.create_filters[closest_idx]
