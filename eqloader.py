@@ -1494,6 +1494,15 @@ class EqLoaderGUI(tk.Tk):
             padx=2
         )
 
+        ttk.Button(
+            button_frame,
+            text="Load from Device",
+            command=self._create_load_from_device
+        ).pack(
+            side="left",
+            padx=2
+        )
+
         # --------------------------------------------------------------
         # Created EQ push controls
         # --------------------------------------------------------------
@@ -1917,6 +1926,60 @@ class EqLoaderGUI(tk.Tk):
         self.gain_var.set("")
         self.q_var.set("")
         self.type_var.set("PK")
+
+    def _create_load_from_device(self):
+
+        if not messagebox.askyesno(
+            "Load from Device",
+            "Load EQ from device? This will replace all current filters."
+        ):
+            return
+
+        def task():
+
+            dev = self._open_selected_device()
+
+            try:
+                slot = get_current_slot(dev)
+
+                result = pull_from_device(
+                    dev,
+                    max_filters=DEFAULT_MAX_FILTERS,
+                    slot_hint=slot,
+                )
+
+            finally:
+                dev.close()
+
+            def apply():
+
+                self.create_filters = [
+                    {
+                        "type": f.get("type", "PK"),
+                        "freq": float(f["freq"]) or 1000.0,
+                        "gain": float(f["gain"]),
+                        "q": float(f["q"]) or 1.0,
+                    }
+                    for f in result["filters"]
+                    if not f.get("disabled", False)
+                ]
+
+                self.selected_filter = (
+                    0 if self.create_filters else -1
+                )
+
+                self.create_preamp_entry.delete(0, "end")
+
+                self.create_preamp_entry.insert(
+                    0,
+                    str(result["globalGain"])
+                )
+
+                self._refresh_create_tab()
+
+            self.after(0, apply)
+
+        self._run_bg(task)
 
     def _create_select_band(self, _event):
 
