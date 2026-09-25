@@ -2374,6 +2374,7 @@ class EqLoaderGUI(tk.Tk):
         self.create_preamp_entry.insert(0, str(data["preamp"]))
 
         self._refresh_create_tab()
+        self._load_selected_filter_into_editor()
         self._log(
             f"Loaded {len(self.create_filters)} "
             f"filter(s) from {path}\n"
