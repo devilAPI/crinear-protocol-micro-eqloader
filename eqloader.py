@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import copy
 import math
 import queue
 import re
@@ -481,6 +482,20 @@ def read_global_gain(dev):
     return signed
 
 
+def is_filter_disabled(ftype, freq, gain, q):
+    """Return True when the device treats this band as OFF.
+
+    The device stores an off band as an inert flat filter
+    (INERT_FILTER: PK, Fc 100, Gain 0, Q 1), so a peaking/shelf band with
+    zero gain is audibly inert and must be treated as off. LP/HP filters
+    shape the signal regardless of gain, so only a fully-zero slot counts.
+    """
+    if ftype in ("PK", "LSQ", "HSQ"):
+        return gain == 0
+
+    return not (freq or q or gain)
+
+
 def parse_filter_packet(packet):
     filter_index = packet[4]
 
@@ -521,8 +536,8 @@ def parse_filter_packet(packet):
         "q": q,
         "gain": gain,
         "type": ftype,
-        "disabled": not (
-            freq or q or gain
+        "disabled": is_filter_disabled(
+            ftype, freq, gain, q
         ),
     }
 
@@ -739,10 +754,11 @@ def save_profile(path, global_gain, filters):
 
         disabled = f.get(
             "disabled",
-            not (
-                f["freq"]
-                or f["q"]
-                or f["gain"]
+            is_filter_disabled(
+                f.get("type", "PK"),
+                f["freq"],
+                f["gain"],
+                f["q"],
             )
         )
 
@@ -821,6 +837,9 @@ class EqLoaderGUI(tk.Tk):
         ]
 
         self.selected_filter = 0
+
+        self._undo_stack = []
+        self._redo_stack = []
 
         self._build_widgets()
 
@@ -1617,6 +1636,26 @@ class EqLoaderGUI(tk.Tk):
             pady=6
         )
 
+        ttk.Button(
+            push_created_frame,
+            text="Save Profile...",
+            command=self._create_save_profile,
+        ).pack(
+            side="left",
+            padx=4,
+            pady=6,
+        )
+
+        ttk.Button(
+            push_created_frame,
+            text="Load Profile...",
+            command=self._create_load_profile,
+        ).pack(
+            side="left",
+            padx=4,
+            pady=6,
+        )
+
         # --------------------------------------------------------------
         # Enable / Disable
         # --------------------------------------------------------------
@@ -1710,6 +1749,10 @@ class EqLoaderGUI(tk.Tk):
         # Initial state
         # --------------------------------------------------------------
 
+        self.bind("<Control-z>", self._undo)
+        self.bind("<Control-y>", self._redo)
+        self.bind("<Control-Shift-z>", self._redo)
+
         self._refresh_create_tab()
 
         self._refresh_devices()
@@ -1765,6 +1808,63 @@ class EqLoaderGUI(tk.Tk):
 
         self._draw_response_graph()
 
+    @staticmethod
+    def _biquad_response_db(freqs, freq0, gain_db, q, ftype, fs=96000):
+        q = max(q, 0.001)
+        w0 = 2 * np.pi * freq0 / fs
+        A = 10 ** (gain_db / 40)
+        alpha = np.sin(w0) / (2 * q)
+        cw = np.cos(w0)
+
+        if ftype == "PK":
+            b0 = 1 + alpha * A
+            b1 = -2 * cw
+            b2 = 1 - alpha * A
+            a0 = 1 + alpha / A
+            a1 = -2 * cw
+            a2 = 1 - alpha / A
+        elif ftype == "LSQ":
+            sqA = np.sqrt(A)
+            b0 = A * ((A + 1) - (A - 1) * cw + 2 * sqA * alpha)
+            b1 = 2 * A * ((A - 1) - (A + 1) * cw)
+            b2 = A * ((A + 1) - (A - 1) * cw - 2 * sqA * alpha)
+            a0 = (A + 1) + (A - 1) * cw + 2 * sqA * alpha
+            a1 = -2 * ((A - 1) + (A + 1) * cw)
+            a2 = (A + 1) + (A - 1) * cw - 2 * sqA * alpha
+        elif ftype == "HSQ":
+            sqA = np.sqrt(A)
+            b0 = A * ((A + 1) + (A - 1) * cw + 2 * sqA * alpha)
+            b1 = -2 * A * ((A - 1) + (A + 1) * cw)
+            b2 = A * ((A + 1) + (A - 1) * cw - 2 * sqA * alpha)
+            a0 = (A + 1) - (A - 1) * cw + 2 * sqA * alpha
+            a1 = 2 * ((A - 1) - (A + 1) * cw)
+            a2 = (A + 1) - (A - 1) * cw - 2 * sqA * alpha
+        elif ftype == "HP":
+            b0 = (1 + cw) / 2
+            b1 = -(1 + cw)
+            b2 = (1 + cw) / 2
+            a0 = 1 + alpha
+            a1 = -2 * cw
+            a2 = 1 - alpha
+        elif ftype == "LP":
+            b0 = (1 - cw) / 2
+            b1 = 1 - cw
+            b2 = (1 - cw) / 2
+            a0 = 1 + alpha
+            a1 = -2 * cw
+            a2 = 1 - alpha
+        else:
+            return np.zeros_like(freqs)
+
+        b0 /= a0; b1 /= a0; b2 /= a0
+        a1 /= a0; a2 /= a0
+
+        w = 2 * np.pi * freqs / fs
+        ejw_n1 = np.exp(-1j * w)
+        ejw_n2 = np.exp(-2j * w)
+        H = (b0 + b1 * ejw_n1 + b2 * ejw_n2) / (1 + a1 * ejw_n1 + a2 * ejw_n2)
+        return 20 * np.log10(np.abs(H) + 1e-12)
+
     def _draw_response_graph(self):
 
         self.ax.clear()
@@ -1775,53 +1875,26 @@ class EqLoaderGUI(tk.Tk):
             1000
         )
 
-        response = np.zeros_like(freqs)
+        response = np.zeros(len(freqs))
 
-        for index, f in enumerate(
-            self.create_filters
-        ):
+        for index, f in enumerate(self.create_filters):
 
             try:
-                center_freq = float(
-                    f["freq"]
-                )
-
-                gain = float(
-                    f["gain"]
-                )
-
-                q = max(
-                    float(f["q"]),
-                    0.01
-                )
-
+                center_freq = float(f["freq"])
+                gain = float(f["gain"])
+                q = max(float(f["q"]), 0.01)
             except (ValueError, TypeError):
                 continue
 
             if center_freq <= 0:
                 continue
 
-            center = np.log10(
-                center_freq
-            )
-
-            width = 1.0 / q
-
-            response += (
-                gain
-                * np.exp(
-                    -(
-                        (
-                            np.log10(freqs)
-                            - center
-                        ) ** 2
-                    )
-                    /
-                    (
-                        2
-                        * (width / 8) ** 2
-                    )
-                )
+            response += self._biquad_response_db(
+                freqs,
+                center_freq,
+                gain,
+                q,
+                f.get("type", "PK"),
             )
 
             color = (
@@ -1835,58 +1908,23 @@ class EqLoaderGUI(tk.Tk):
                 [gain],
                 marker="o",
                 markersize=8,
-                color=color
+                color=color,
             )
 
-        self.ax.plot(
-            freqs,
-            response,
-            linewidth=2,
-            color="tab:blue"
-        )
-
-        self.ax.axhline(
-            0,
-            color="gray",
-            linewidth=0.8
-        )
-
-        self.ax.set_xscale(
-            "log"
-        )
-
-        self.ax.set_xlim(
-            20,
-            20000
-        )
-
-        self.ax.set_ylim(
-            -15,
-            15
-        )
-
-        self.ax.grid(
-            True,
-            which="both",
-            alpha=0.3
-        )
-
-        self.ax.set_title(
-            "EQ Response Preview"
-        )
-
-        self.ax.set_xlabel(
-            "Frequency (Hz)"
-        )
-
-        self.ax.set_ylabel(
-            "Gain (dB)"
-        )
-
+        self.ax.plot(freqs, response, linewidth=2, color="tab:blue")
+        self.ax.axhline(0, color="gray", linewidth=0.8)
+        self.ax.set_xscale("log")
+        self.ax.set_xlim(20, 20000)
+        self.ax.set_ylim(-15, 15)
+        self.ax.grid(True, which="both", alpha=0.3)
+        self.ax.set_title("EQ Response Preview")
+        self.ax.set_xlabel("Frequency (Hz)")
+        self.ax.set_ylabel("Gain (dB)")
         self.canvas_graph.draw_idle()
 
     def _create_add_band(self):
 
+        self._snapshot()
         self.create_filters.append({
             "type": "PK",
             "freq": 1000.0,
@@ -1911,6 +1949,7 @@ class EqLoaderGUI(tk.Tk):
 
         index = sel[0]
 
+        self._snapshot()
         del self.create_filters[index]
 
         if not self.create_filters:
@@ -1934,6 +1973,7 @@ class EqLoaderGUI(tk.Tk):
         ):
             return
 
+        self._snapshot()
         self.create_filters.clear()
 
         self.selected_filter = -1
@@ -1970,7 +2010,7 @@ class EqLoaderGUI(tk.Tk):
                 dev.close()
 
             def apply():
-
+                self._snapshot()
                 self.create_filters = [
                     {
                         "type": f.get("type", "PK"),
@@ -2127,6 +2167,7 @@ class EqLoaderGUI(tk.Tk):
             self.selected_filter
         ]
 
+        self._snapshot()
         f["freq"] = freq
         f["gain"] = gain
         f["q"] = q
@@ -2148,7 +2189,7 @@ class EqLoaderGUI(tk.Tk):
 
         if self.bw_mode.get():
             bw = (
-                2 * math.asinh(1 / (2 * val))
+                2 * math.asinh(1 / (2 * max(val, 0.001)))
                 / math.log(2)
             )
             self.q_var.set(f"{bw:.3f}")
@@ -2164,6 +2205,56 @@ class EqLoaderGUI(tk.Tk):
             self.q_var.set(f"{q:.3f}")
             self.q_label.config(text="Q")
 
+    def _snapshot(self):
+        self._undo_stack.append((
+            copy.deepcopy(self.create_filters),
+            self.create_preamp_entry.get(),
+            self.selected_filter,
+        ))
+        self._redo_stack.clear()
+
+    def _undo(self, _event=None):
+
+        if not self._undo_stack:
+            return
+
+        self._redo_stack.append((
+            copy.deepcopy(self.create_filters),
+            self.create_preamp_entry.get(),
+            self.selected_filter,
+        ))
+
+        filters, preamp, sel = self._undo_stack.pop()
+        self.create_filters = filters
+        self.selected_filter = max(
+            -1, min(sel, len(self.create_filters) - 1)
+        )
+        self.create_preamp_entry.delete(0, "end")
+        self.create_preamp_entry.insert(0, preamp)
+        self._refresh_create_tab()
+        self._load_selected_filter_into_editor()
+
+    def _redo(self, _event=None):
+
+        if not self._redo_stack:
+            return
+
+        self._undo_stack.append((
+            copy.deepcopy(self.create_filters),
+            self.create_preamp_entry.get(),
+            self.selected_filter,
+        ))
+
+        filters, preamp, sel = self._redo_stack.pop()
+        self.create_filters = filters
+        self.selected_filter = max(
+            -1, min(sel, len(self.create_filters) - 1)
+        )
+        self.create_preamp_entry.delete(0, "end")
+        self.create_preamp_entry.insert(0, preamp)
+        self._refresh_create_tab()
+        self._load_selected_filter_into_editor()
+
     # ==================================================================
     # Mouse drag-and-drop graph controls
     # ==================================================================
@@ -2176,6 +2267,10 @@ class EqLoaderGUI(tk.Tk):
         gain = float(event.ydata)
 
         if freq < 20 or freq > 20000:
+            return
+
+        if event.button == 3:
+            self._on_right_click_graph(freq, gain)
             return
 
         if not hasattr(self, "_dragging_point_idx"):
@@ -2201,6 +2296,7 @@ class EqLoaderGUI(tk.Tk):
             self._load_selected_filter_into_editor()
             self._draw_response_graph()
         else:
+            self._snapshot()
             self.create_filters.append({
                 "type": "PK",
                 "freq": round(freq, 1),
@@ -2231,6 +2327,54 @@ class EqLoaderGUI(tk.Tk):
         if getattr(self, "_dragging_point_idx", None) is not None:
             self._dragging_point_idx = None
             self._refresh_create_tab()
+
+    def _on_right_click_graph(self, freq, gain):
+
+        if not self.create_filters:
+            return
+
+        click_x_log = math.log10(freq)
+        closest_idx = -1
+        min_dist = float('inf')
+
+        for i, f in enumerate(self.create_filters):
+            px = f.get("freq", 0)
+            py = f.get("gain", 0)
+            if px <= 0:
+                continue
+            dist = math.hypot(
+                (math.log10(px) - click_x_log) * 10,
+                py - gain,
+            )
+            if dist < min_dist:
+                min_dist = dist
+                closest_idx = i
+
+        if min_dist >= 2.0 or closest_idx < 0:
+            return
+
+        f = self.create_filters[closest_idx]
+
+        if not messagebox.askyesno(
+            "Delete Band",
+            f"Delete band {closest_idx + 1} "
+            f"({float(f['freq']):.1f} Hz)?"
+        ):
+            return
+
+        self._snapshot()
+        del self.create_filters[closest_idx]
+
+        if not self.create_filters:
+            self.selected_filter = -1
+        else:
+            self.selected_filter = min(
+                closest_idx,
+                len(self.create_filters) - 1,
+            )
+
+        self._refresh_create_tab()
+        self._load_selected_filter_into_editor()
 
     def _create_push(self):
 
@@ -2301,6 +2445,74 @@ class EqLoaderGUI(tk.Tk):
                 dev.close()
 
         self._run_bg(task)
+
+    def _create_save_profile(self):
+
+        if not self.create_filters:
+            messagebox.showwarning(
+                "No Filters",
+                "Add at least one EQ band first."
+            )
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if not path:
+            return
+
+        preamp = self._parse_float(
+            self.create_preamp_entry.get(),
+            0.0,
+        )
+
+        try:
+            save_profile(path, preamp, self.create_filters)
+            self._log(f"Profile saved to {path}\n")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def _create_load_profile(self):
+
+        path = filedialog.askopenfilename(
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if not path:
+            return
+
+        try:
+            data = load_profile(path)
+        except Exception as e:
+            messagebox.showerror("Load Error", str(e))
+            return
+
+        self._snapshot()
+        self.create_filters = [
+            dict(f) for f in data["filters"]
+        ]
+
+        self.selected_filter = (
+            0 if self.create_filters else -1
+        )
+
+        self.create_preamp_entry.delete(0, "end")
+        self.create_preamp_entry.insert(0, str(data["preamp"]))
+
+        self._refresh_create_tab()
+        self._load_selected_filter_into_editor()
+        self._log(
+            f"Loaded {len(self.create_filters)} "
+            f"filter(s) from {path}\n"
+        )
 
     # ==================================================================
     # Device discovery
