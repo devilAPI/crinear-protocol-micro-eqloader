@@ -1599,6 +1599,26 @@ class EqLoaderGUI(tk.Tk):
             pady=6
         )
 
+        ttk.Button(
+            push_created_frame,
+            text="Save Profile...",
+            command=self._create_save_profile,
+        ).pack(
+            side="left",
+            padx=4,
+            pady=6,
+        )
+
+        ttk.Button(
+            push_created_frame,
+            text="Load Profile...",
+            command=self._create_load_profile,
+        ).pack(
+            side="left",
+            padx=4,
+            pady=6,
+        )
+
         # --------------------------------------------------------------
         # Enable / Disable
         # --------------------------------------------------------------
@@ -2277,6 +2297,72 @@ class EqLoaderGUI(tk.Tk):
                 dev.close()
 
         self._run_bg(task)
+
+    def _create_save_profile(self):
+
+        if not self.create_filters:
+            messagebox.showwarning(
+                "No Filters",
+                "Add at least one EQ band first."
+            )
+            return
+
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if not path:
+            return
+
+        preamp = self._parse_float(
+            self.create_preamp_entry.get(),
+            0.0,
+        )
+
+        try:
+            save_profile(path, preamp, self.create_filters)
+            self._log(f"Profile saved to {path}\n")
+        except Exception as e:
+            messagebox.showerror("Save Error", str(e))
+
+    def _create_load_profile(self):
+
+        path = filedialog.askopenfilename(
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("All files", "*.*"),
+            ],
+        )
+
+        if not path:
+            return
+
+        try:
+            data = load_profile(path)
+        except Exception as e:
+            messagebox.showerror("Load Error", str(e))
+            return
+
+        self.create_filters = [
+            dict(f) for f in data["filters"]
+        ]
+
+        self.selected_filter = (
+            0 if self.create_filters else -1
+        )
+
+        self.create_preamp_entry.delete(0, "end")
+        self.create_preamp_entry.insert(0, str(data["preamp"]))
+
+        self._refresh_create_tab()
+        self._log(
+            f"Loaded {len(self.create_filters)} "
+            f"filter(s) from {path}\n"
+        )
 
     # ==================================================================
     # Device discovery
