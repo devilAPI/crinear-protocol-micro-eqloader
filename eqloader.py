@@ -1541,7 +1541,7 @@ class EqLoaderGUI(tk.Tk):
              "Ctrl+O", "<Control-o>"),
             ("Compute AutoEQ", self._create_autoeq, "TButton",
              "Ctrl+Shift+A", "<Control-Shift-A>"),
-            ("Load Pre-computed AutoEQ...", self._create_load_autoeq_profile, "TButton",
+            ("Load Pre-computed AutoEQ", self._create_load_autoeq_profile, "TButton",
              "Ctrl+Shift+L", "<Control-Shift-L>"),
             ("Push EQ to Device", self._create_push, "Accent.TButton", "Ctrl+P", "<Control-p>"),
         )
