@@ -15,7 +15,6 @@ A standalone desktop tool for pushing and editing parametric EQ profiles on Walk
 - **OFF-band handling** — `OFF` bands and peaking/shelf filters with zero gain are automatically skipped when loading, matching the device's own behaviour.
 - **Enable / disable PEQ** — toggle the hardware EQ on or off per slot without touching the stored profile.
 - **Undo / redo** — full history for all editor changes (Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z).
-- **Dark instrument-panel UI** — themed to match the feel of the hardware it talks to.
 
 ## Requirements
 
