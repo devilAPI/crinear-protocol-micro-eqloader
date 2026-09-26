@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
+"""Walkplay PEQ loader.
 
+Edit, push and pull parametric EQ on Walkplay-based USB DAC dongles (e.g. the
+Crinear Protocol Micro), with an AutoEQ optimizer backed by the public AutoEq
+measurement database. Run without arguments for the GUI; see --help for the CLI.
+
+Sections, bottom-up:
+    device protocol -> profile files -> filter math -> AutoEQ engine
+    -> AutoEQ database -> GUI -> CLI
+
+Throughout, a band ("filter") is a dict {"type", "freq", "gain", "q"} with
+type one of FILTER_TYPES, and a curve is a list of (freq, dB) tuples.
+"""
+
+import argparse
+import contextlib
 import copy
 import json
 import math
@@ -17,7 +32,6 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
-from matplotlib import ticker
 import numpy as np
 
 try:
@@ -27,42 +41,7 @@ except ImportError:
 
 
 # ===========================================================================
-# Theme: "instrument panel" (graphite chassis, two-LED accent)
-# ===========================================================================
-
-THEME = {
-    "chassis":   "#14161A",  # deep graphite base
-    "panel":     "#1C1F26",  # raised frame / surface
-    "input":     "#262A33",  # entries, hover
-    "line":      "#2E333D",  # hairline borders / grid
-    "ink":       "#E6E9EF",  # primary text
-    "muted":     "#8A93A3",  # secondary labels
-    "accent":    "#4ED0C4",  # cyan signal / idle trace
-    "accent_dk": "#2C8F87",  # pressed / darker cyan
-    "active":    "#F0A93B",  # amber, selected band
-    "danger":    "#E5687A",  # destructive action
-}
-
-MONO_FONTS = ("JetBrains Mono", "DejaVu Sans Mono", "Consolas", "Menlo",
-              "Courier New", "monospace")
-UI_FONTS = ("Inter", "Segoe UI", "Helvetica Neue", "DejaVu Sans", "sans-serif")
-
-
-def _pick_font(root, families):
-    """Return the first installed font family, else the last fallback."""
-    try:
-        import tkinter.font as tkfont
-        available = {f.lower() for f in tkfont.families(root)}
-        for fam in families:
-            if fam.lower() in available:
-                return fam
-    except Exception:
-        pass
-    return families[-1]
-
-
-# ===========================================================================
-# Core protocol / device I/O
+# Device protocol (Walkplay HID)
 # ===========================================================================
 
 WALKPLAY_VENDOR_ID = 0x3302
@@ -81,6 +60,7 @@ CMD = {
     "VERSION": 0x0C,
 }
 
+FILTER_TYPES = ("PK", "LSQ", "HSQ", "LP", "HP")
 FILTER_TYPE_TO_BYTE = {"LSQ": 1, "PK": 2, "HSQ": 3, "LP": 4, "HP": 5}
 BYTE_TO_FILTER_TYPE = {v: k for k, v in FILTER_TYPE_TO_BYTE.items()}
 
@@ -89,9 +69,22 @@ DEFAULT_MAX_FILTERS = 8
 # Rate the device's biquad coefficients are designed at (see compute_iir_filter).
 DEVICE_SAMPLE_RATE = 96000
 
+# How the device stores an unused band; also used to pad pushes.
+INERT_FILTER = {"type": "PK", "freq": 100.0, "gain": 0.0, "q": 1.0}
+
+
+def _require_hid():
+    if hid is None:
+        raise RuntimeError("hidapi not installed (pip install hidapi)")
+
+
+def find_devices(vid=WALKPLAY_VENDOR_ID):
+    _require_hid()
+    return [d for d in hid.enumerate() if d["vendor_id"] == vid]
+
 
 def list_devices():
-    devices = [d for d in hid.enumerate() if d["vendor_id"] == WALKPLAY_VENDOR_ID]
+    devices = find_devices()
     if not devices:
         print("No Walkplay-vendor (0x3302) HID devices found.")
         return
@@ -108,6 +101,8 @@ def list_devices():
 
 
 def open_device(vid=None, pid=None, path=None):
+    """Open by HID path, else by VID/PID, else the first device with `vid`."""
+    _require_hid()
     dev = hid.device()
     if path:
         dev.open_path(path)
@@ -118,7 +113,7 @@ def open_device(vid=None, pid=None, path=None):
         dev.open(vid, pid)
         return dev
 
-    candidates = [d for d in hid.enumerate() if d["vendor_id"] == vid]
+    candidates = find_devices(vid)
     if not candidates:
         raise RuntimeError(
             f"No HID device found with vendor id 0x{vid:04X}. "
@@ -126,9 +121,7 @@ def open_device(vid=None, pid=None, path=None):
         )
     if len(candidates) > 1:
         names = ", ".join(
-            f"0x{d['product_id']:04X} ({d.get('product_string')})"
-            for d in candidates
-        )
+            f"0x{d['product_id']:04X} ({d.get('product_string')})" for d in candidates)
         print(
             f"Warning: multiple Walkplay devices/interfaces found ({names}). "
             f"Using the first one. Select a specific device in the list, or set PID."
@@ -137,9 +130,19 @@ def open_device(vid=None, pid=None, path=None):
     return dev
 
 
-def send_report(dev, report_id, packet):
-    payload = list(packet) + [0] * max(0, REPORT_LENGTH - len(packet))
-    dev.write(bytes([report_id]) + bytes(payload[:REPORT_LENGTH]))
+@contextlib.contextmanager
+def device_session(vid=None, pid=None, path=None):
+    """`with device_session(...) as dev:` — opens the device, always closes it."""
+    dev = open_device(vid=vid, pid=pid, path=path)
+    try:
+        yield dev
+    finally:
+        dev.close()
+
+
+def send_report(dev, packet):
+    payload = bytes(packet[:REPORT_LENGTH]).ljust(REPORT_LENGTH, b"\0")
+    dev.write(bytes([REPORT_ID]) + payload)
 
 
 def _read_report(dev, timeout_ms=200):
@@ -152,158 +155,54 @@ def wait_for_response(dev, expected_cmd, timeout=2.0):
     while time.time() < deadline:
         remaining_ms = max(1, int((deadline - time.time()) * 1000))
         data = _read_report(dev, timeout_ms=min(200, remaining_ms))
-        if data is None:
-            continue
-        if len(data) > 1 and data[1] == expected_cmd:
+        if data is not None and len(data) > 1 and data[1] == expected_cmd:
             return data
     raise TimeoutError(f"Timeout waiting for response to cmd 0x{expected_cmd:02X}")
 
 
-def _to_i32(value):
-    value &= 0xFFFFFFFF
-    return value - 0x100000000 if value & 0x80000000 else value
-
-
-def quantizer(d_arr, d_arr2):
-    i_arr = [round(d * 1073741824) for d in d_arr]
-    i_arr2 = [round(d * 1073741824) for d in d_arr2]
-    return [i_arr2[0], i_arr2[1], i_arr2[2], -i_arr[1], -i_arr[2]]
-
-
-def compute_iir_filter(freq, gain, q):
-    sqrt = math.sqrt(10 ** (gain / 20))
-    d3 = (freq * 6.283185307179586) / DEVICE_SAMPLE_RATE
-    sin = math.sin(d3) / (2 * q)
-    d4 = sin * sqrt
-    d5 = sin / sqrt
-    d6 = d5 + 1
-
-    quantizer_data = quantizer(
-        [1, (math.cos(d3) * -2) / d6, (1 - d5) / d6],
-        [(d4 + 1) / d6, (math.cos(d3) * -2) / d6, (1 - d4) / d6],
-    )
-
-    b_arr = [0] * 20
-    index = 0
-    for value in quantizer_data:
-        value = _to_i32(value) & 0xFFFFFFFF
-        b_arr[index] = value & 0xFF
-        b_arr[index + 1] = (value >> 8) & 0xFF
-        b_arr[index + 2] = (value >> 16) & 0xFF
-        b_arr[index + 3] = (value >> 24) & 0xFF
-        index += 4
-    return b_arr
-
-
-def convert_to_byte_array(value, length):
+def _le_bytes(value, length):
     value = int(round(value))
     return [(value >> (8 * i)) & 0xFF for i in range(length)]
 
 
-def get_current_slot(dev):
-    send_report(dev, REPORT_ID, [READ, CMD["VERSION"], END])
-    resp = wait_for_response(dev, CMD["VERSION"])
-    version = bytes(resp[3:6]).decode("ascii", errors="ignore")
-    print(f"Firmware version: {version!r}")
+def compute_iir_filter(freq, gain, q):
+    """The 20 coefficient bytes of one band, as the device expects them.
 
-    send_report(dev, REPORT_ID, [READ, CMD["PEQ_VALUES"], END])
-    resp = wait_for_response(dev, CMD["PEQ_VALUES"])
-    slot = resp[35] if len(resp) > 35 else -1
-    print(f"Current EQ slot: {slot}")
-    return slot
-
-
-def push_to_device(dev, slot, global_gain, filters,
-                   buffer_db=DEFAULT_GLOBAL_GAIN_BUFFER, write_gain=True):
-    slot = int(slot)
-
-    for i, f in enumerate(filters):
-        b_arr = compute_iir_filter(f["freq"], f["gain"], f["q"])
-        packet = (
-            [WRITE, CMD["PEQ_VALUES"], 0x18, 0x00, i, 0x00, 0x00]
-            + b_arr
-            + convert_to_byte_array(f["freq"], 2)
-            + convert_to_byte_array(round(f["q"] * 256), 2)
-            + convert_to_byte_array(round(f["gain"] * 256) & 0xFFFF, 2)
-            + [FILTER_TYPE_TO_BYTE.get(f.get("type", "PK"), 2), 0x00, slot, END]
-        )
-        send_report(dev, REPORT_ID, packet)
-        time.sleep(0.02)
-
-    time.sleep(0.1)
-
-    if write_gain:
-        gain_to_write = round(min(0, global_gain - buffer_db))
-        write_global_gain(dev, gain_to_write)
-        print(
-            f"Set global gain register to {gain_to_write} dB "
-            f"(preamp {global_gain} dB, hardware buffer {buffer_db} dB)"
-        )
-        time.sleep(0.05)
-
-    send_report(dev, REPORT_ID, [WRITE, 0x05, END])
-    time.sleep(0.02)
-    send_report(dev, REPORT_ID, [WRITE, 0x17, END])
-    time.sleep(0.02)
-    send_report(dev, REPORT_ID,
-                [WRITE, CMD["TEMP_WRITE"], 0x04, 0x00, 0x00, 0xFF, 0xFF, END])
-    time.sleep(0.05)
-    send_report(dev, REPORT_ID, [WRITE, CMD["FLASH_EQ"], END])
-    print(f"Pushed {len(filters)} filter(s) to slot {slot} and flashed to device.")
-
-
-def write_global_gain(dev, value_db):
-    gain_value = round(value_db) & 0xFF
-    send_report(dev, REPORT_ID,
-                [WRITE, CMD["GLOBAL_GAIN"], 0x02, 0x00, gain_value])
-
-
-def read_global_gain(dev):
-    send_report(dev, REPORT_ID, [READ, CMD["GLOBAL_GAIN"], 0x00])
-    resp = wait_for_response(dev, CMD["GLOBAL_GAIN"], timeout=1.0)
-    raw = resp[4]
-    return raw - 256 if raw > 127 else raw
-
-
-def is_filter_disabled(ftype, freq, gain, q):
-    """Return True when the device treats this band as OFF.
-
-    The device stores an off band as an inert flat filter (PK, Fc 100, Gain 0,
-    Q 1), so a peaking/shelf band with zero gain is audibly inert and must be
-    treated as off. LP/HP filters shape the signal regardless of gain, so only
-    a fully-zero slot counts.
+    RBJ peaking biquad at DEVICE_SAMPLE_RATE (always a peaking design,
+    whatever the band's type, matching the vendor tool), as Q2.30 fixed point
+    words b0, b1, b2, -a1, -a2, little-endian.
     """
-    if ftype in ("PK", "LSQ", "HSQ"):
-        return gain == 0
-    return not (freq or q or gain)
+    amp = math.sqrt(10 ** (gain / 20))
+    w0 = (freq * (2 * math.pi)) / DEVICE_SAMPLE_RATE
+    alpha = math.sin(w0) / (2 * q)
+    a0 = alpha / amp + 1
+    mid = (math.cos(w0) * -2) / a0
+    b0 = (alpha * amp + 1) / a0
+    b2 = (1 - alpha * amp) / a0
+    a2 = (1 - alpha / amp) / a0
+
+    def q30(x):
+        return round(x * (1 << 30))
+
+    words = [q30(b0), q30(mid), q30(b2), -q30(mid), -q30(a2)]
+    return [byte for w in words for byte in (w & 0xFFFFFFFF).to_bytes(4, "little")]
 
 
-def dedupe_filters(filters):
-    """Drop exact-duplicate bands, keeping first occurrence.
-
-    The device always stores a fixed number of slots (typically 8); pushing
-    fewer bands leaves it padding the tail by repeating the last band(s), so a
-    pulled profile can contain identical copies. Two bands with the same type,
-    frequency, gain and Q are audibly one band, so we keep only the first.
-    """
-    seen = set()
-    result = []
-    for f in filters:
-        key = (f.get("type", "PK"),
-               round(float(f["freq"]), 2),
-               round(float(f["gain"]), 2),
-               round(float(f["q"]), 3))
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(f)
-    return result
+def build_filter_packet(index, f, slot):
+    """PEQ_VALUES write packet for band `index` of `slot` (parse_filter_packet inverts it)."""
+    return (
+        [WRITE, CMD["PEQ_VALUES"], 0x18, 0x00, index, 0x00, 0x00]
+        + compute_iir_filter(f["freq"], f["gain"], f["q"])
+        + _le_bytes(f["freq"], 2)
+        + _le_bytes(round(f["q"] * 256), 2)
+        + _le_bytes(round(f["gain"] * 256) & 0xFFFF, 2)
+        + [FILTER_TYPE_TO_BYTE.get(f.get("type", "PK"), 2), 0x00, slot, END]
+    )
 
 
 def parse_filter_packet(packet):
     freq = packet[27] | (packet[28] << 8)
-    q_raw = packet[29] | (packet[30] << 8)
-    q = round((q_raw / 256) * 100) / 100
+    q = round(((packet[29] | (packet[30] << 8)) / 256) * 100) / 100
 
     gain_raw = packet[31] | (packet[32] << 8)
     if gain_raw > 32767:
@@ -321,15 +220,72 @@ def parse_filter_packet(packet):
     }
 
 
-def pull_from_device(dev, max_filters, slot_hint=-1, timeout=10.0):
-    filters = {}
-    deadline = time.time() + timeout
+def get_current_slot(dev):
+    send_report(dev, [READ, CMD["VERSION"], END])
+    resp = wait_for_response(dev, CMD["VERSION"])
+    version = bytes(resp[3:6]).decode("ascii", errors="ignore")
+    print(f"Firmware version: {version!r}")
 
+    send_report(dev, [READ, CMD["PEQ_VALUES"], END])
+    resp = wait_for_response(dev, CMD["PEQ_VALUES"])
+    slot = resp[35] if len(resp) > 35 else -1
+    print(f"Current EQ slot: {slot}")
+    return slot
+
+
+def write_global_gain(dev, value_db):
+    send_report(dev, [WRITE, CMD["GLOBAL_GAIN"], 0x02, 0x00, round(value_db) & 0xFF])
+
+
+def read_global_gain(dev):
+    send_report(dev, [READ, CMD["GLOBAL_GAIN"], 0x00])
+    raw = wait_for_response(dev, CMD["GLOBAL_GAIN"], timeout=1.0)[4]
+    return raw - 256 if raw > 127 else raw
+
+
+def push_to_device(dev, slot, global_gain, filters,
+                   buffer_db=DEFAULT_GLOBAL_GAIN_BUFFER, write_gain=True):
+    """Write `filters` to `slot`, set the gain register, and flash."""
+    slot = int(slot)
+    for i, f in enumerate(filters):
+        send_report(dev, build_filter_packet(i, f, slot))
+        time.sleep(0.02)
+    time.sleep(0.1)
+
+    if write_gain:
+        gain_to_write = round(min(0, global_gain - buffer_db))
+        write_global_gain(dev, gain_to_write)
+        print(
+            f"Set global gain register to {gain_to_write} dB "
+            f"(preamp {global_gain} dB, hardware buffer {buffer_db} dB)"
+        )
+        time.sleep(0.05)
+
+    # Commit sequence as sent by the vendor tool (0x05/0x17 are undocumented).
+    for packet, pause in (
+        ([WRITE, 0x05, END], 0.02),
+        ([WRITE, 0x17, END], 0.02),
+        ([WRITE, CMD["TEMP_WRITE"], 0x04, 0x00, 0x00, 0xFF, 0xFF, END], 0.05),
+    ):
+        send_report(dev, packet)
+        time.sleep(pause)
+    send_report(dev, [WRITE, CMD["FLASH_EQ"], END])
+    print(f"Pushed {len(filters)} filter(s) to slot {slot} and flashed to device.")
+
+
+def pull_from_device(dev, max_filters, slot_hint=-1, timeout=10.0):
+    """Read `max_filters` bands and the gain register.
+
+    Returns {"currentSlot", "globalGain", "filters"}; filters are
+    parse_filter_packet() dicts ordered by band index.
+    """
     for i in range(max_filters):
-        send_report(dev, REPORT_ID, [READ, CMD["PEQ_VALUES"], 0x00, 0x00, i, END])
+        send_report(dev, [READ, CMD["PEQ_VALUES"], 0x00, 0x00, i, END])
         time.sleep(0.05)
     time.sleep(0.1)
 
+    filters = {}
+    deadline = time.time() + timeout
     while len(filters) < max_filters and time.time() < deadline:
         data = _read_report(dev, timeout_ms=200)
         if data is None or len(data) < 34 or data[1] != CMD["PEQ_VALUES"]:
@@ -346,19 +302,85 @@ def pull_from_device(dev, max_filters, slot_hint=-1, timeout=10.0):
         print("Warning: could not read global gain.")
         global_gain = 0
 
-    ordered = [filters[i] for i in sorted(filters.keys())]
-    return {"currentSlot": slot_hint, "globalGain": global_gain, "filters": ordered}
+    return {"currentSlot": slot_hint, "globalGain": global_gain,
+            "filters": [filters[i] for i in sorted(filters)]}
 
 
 def enable_peq(dev, enable, slot_id=0):
-    if not enable:
-        slot_id = 0x00
-    send_report(dev, REPORT_ID,
-                [WRITE, CMD["FLASH_EQ"], 1 if enable else 0, slot_id, END])
+    send_report(dev, [WRITE, CMD["FLASH_EQ"], 1 if enable else 0,
+                      slot_id if enable else 0x00, END])
+
+
+# ---------------------------------------------------------------------------
+# Band-list helpers
+# ---------------------------------------------------------------------------
+
+def is_filter_disabled(ftype, freq, gain, q):
+    """Return True when the device treats this band as OFF.
+
+    The device stores an off band as an inert flat filter (PK, Fc 100, Gain 0,
+    Q 1), so a peaking/shelf band with zero gain is audibly inert and must be
+    treated as off. LP/HP filters shape the signal regardless of gain, so only
+    a fully-zero slot counts.
+    """
+    if ftype in ("PK", "LSQ", "HSQ"):
+        return gain == 0
+    return not (freq or q or gain)
+
+
+def filter_is_off(f):
+    """Explicit "disabled" flag if present (profiles, pulls), else inferred."""
+    return f.get("disabled", is_filter_disabled(
+        f.get("type", "PK"), f["freq"], f["gain"], f["q"]))
+
+
+def dedupe_filters(filters):
+    """Drop exact-duplicate bands, keeping first occurrence.
+
+    The device always stores a fixed number of slots (typically 8); pushing
+    fewer bands leaves it padding the tail by repeating the last band(s), so a
+    pulled profile can contain identical copies. Two bands with the same type,
+    frequency, gain and Q are audibly one band, so we keep only the first.
+    """
+    seen = set()
+    result = []
+    for f in filters:
+        key = (f.get("type", "PK"),
+               round(float(f["freq"]), 2),
+               round(float(f["gain"]), 2),
+               round(float(f["q"]), 3))
+        if key not in seen:
+            seen.add(key)
+            result.append(f)
+    return result
+
+
+def active_filters(filters):
+    """Editable bands from a loaded/pulled profile: OFF bands dropped, values
+    coerced to float (a zero freq/Q replaced by a usable default) and exact
+    duplicates collapsed."""
+    return dedupe_filters([
+        {
+            "type": f.get("type", "PK"),
+            "freq": float(f["freq"]) or 1000.0,
+            "gain": float(f["gain"]),
+            "q": float(f["q"]) or 1.0,
+        }
+        for f in filters if not filter_is_off(f)
+    ])
+
+
+def pad_for_push(filters, max_filters):
+    """Copy of `filters` padded with inert bands up to the device's slot count,
+    so the device doesn't backfill the unused tail slots with copies of the
+    last real band."""
+    padded = [dict(f) for f in filters]
+    padded += [dict(INERT_FILTER) for _ in range(max_filters - len(padded))]
+    return padded
 
 
 # ===========================================================================
-# Profile .txt format
+# Profile .txt format (EqualizerAPO / eq.hangout.audio)
 # ===========================================================================
 
 TXT_TYPE_TO_INTERNAL = {
@@ -366,8 +388,6 @@ TXT_TYPE_TO_INTERNAL = {
     "PK": "PK", "LP": "LP", "HP": "HP",
 }
 INTERNAL_TYPE_TO_TXT = {"LSQ": "LS", "HSQ": "HS", "PK": "PK", "LP": "LP", "HP": "HP"}
-
-INERT_FILTER = {"type": "PK", "freq": 100.0, "gain": 0.0, "q": 1.0}
 
 _PREAMP_RE = re.compile(r'^\s*Preamp:\s*([+-]?[\d.,]+)\s*dB', re.IGNORECASE)
 _FILTER_RE = re.compile(
@@ -390,6 +410,8 @@ def fmt_num(value, decimals):
 
 
 def load_profile(path):
+    """Returns {"preamp": dB, "filters": [...]}; OFF bands come back as
+    INERT_FILTER copies flagged "disabled"."""
     preamp = 0.0
     filters = []
 
@@ -406,9 +428,7 @@ def load_profile(path):
 
             enabled, txt_type, freq, gain, q = m.groups()
             if enabled.upper() == "OFF":
-                f = dict(INERT_FILTER)
-                f["disabled"] = True
-                filters.append(f)
+                filters.append(dict(INERT_FILTER, disabled=True))
                 continue
 
             filters.append({
@@ -420,17 +440,13 @@ def load_profile(path):
 
     if not filters:
         raise ValueError(f"No 'Filter N: ...' lines found in {path}")
-
     return {"preamp": preamp, "filters": filters}
 
 
 def save_profile(path, global_gain, filters):
     lines = [f"Preamp: {fmt_num(float(global_gain), 1)} dB"]
-
     for i, f in enumerate(filters, start=1):
-        disabled = f.get("disabled", is_filter_disabled(
-            f.get("type", "PK"), f["freq"], f["gain"], f["q"]))
-        state = "OFF" if disabled else "ON"
+        state = "OFF" if filter_is_off(f) else "ON"
         txt_type = INTERNAL_TYPE_TO_TXT.get(f["type"], f["type"])
         lines.append(
             f"Filter {i}: {state} {txt_type} "
@@ -438,13 +454,93 @@ def save_profile(path, global_gain, filters):
             f"Gain {fmt_num(float(f['gain']), 1)} dB "
             f"Q {fmt_num(float(f['q']), 3)}"
         )
-
     with open(path, "w") as fh:
         fh.write("\n".join(lines) + "\n")
 
 
 # ===========================================================================
-# AutoEQ (port of the autoeq.app biquad.py / biquad-coeffs-cookbook logic)
+# Filter math (RBJ cookbook biquads)
+# ===========================================================================
+
+def biquad_coeffs(ftype, freq, gain, q, fs=DEVICE_SAMPLE_RATE):
+    """(1, a1, a2, b0, b1, b2) normalized by a0, or None for an unknown type.
+
+    Inputs are clamped as in AutoEq's biquad.py (the source of hangout.audio's
+    equalizer.js, which the AutoEQ engine below ports).
+    """
+    w0 = 2 * math.pi * max(1e-6, min(freq / fs, 1))
+    q = max(1e-4, min(q, 1000))
+    gain = max(-40, min(gain, 40))
+    sin, cos = math.sin(w0), math.cos(w0)
+    a = 10 ** (gain / 40)
+    alpha = sin / (2 * q)
+
+    if ftype == "PK":
+        a0, a1, a2 = 1 + alpha / a, -2 * cos, 1 - alpha / a
+        b0, b1, b2 = 1 + alpha * a, -2 * cos, 1 - alpha * a
+    elif ftype == "LSQ":
+        am = 2 * math.sqrt(a) * alpha
+        a0 = (a + 1) + (a - 1) * cos + am
+        a1 = -2 * ((a - 1) + (a + 1) * cos)
+        a2 = (a + 1) + (a - 1) * cos - am
+        b0 = a * ((a + 1) - (a - 1) * cos + am)
+        b1 = 2 * a * ((a - 1) - (a + 1) * cos)
+        b2 = a * ((a + 1) - (a - 1) * cos - am)
+    elif ftype == "HSQ":
+        am = 2 * math.sqrt(a) * alpha
+        a0 = (a + 1) - (a - 1) * cos + am
+        a1 = 2 * ((a - 1) - (a + 1) * cos)
+        a2 = (a + 1) - (a - 1) * cos - am
+        b0 = a * ((a + 1) + (a - 1) * cos + am)
+        b1 = -2 * a * ((a - 1) + (a + 1) * cos)
+        b2 = a * ((a + 1) + (a - 1) * cos - am)
+    elif ftype == "LP":
+        a0, a1, a2 = 1 + alpha, -2 * cos, 1 - alpha
+        b0, b1, b2 = (1 - cos) / 2, 1 - cos, (1 - cos) / 2
+    elif ftype == "HP":
+        a0, a1, a2 = 1 + alpha, -2 * cos, 1 - alpha
+        b0, b1, b2 = (1 + cos) / 2, -(1 + cos), (1 + cos) / 2
+    else:
+        return None
+    return (1.0, a1 / a0, a2 / a0, b0 / a0, b1 / a0, b2 / a0)
+
+
+def biquad_phi(freqs, fs):
+    """Per-frequency term of gains_db(); depends only on the grid, so hot
+    loops compute it once."""
+    w = 2 * np.pi * np.asarray(freqs, dtype=float) / fs
+    return 4 * np.sin(w / 2) ** 2
+
+
+def gains_db(phi, coeffs):
+    """Summed magnitude response (dB) of biquads `coeffs` at biquad_phi() points."""
+    gains = np.zeros(len(phi))
+    for a0, a1, a2, b0, b1, b2 in coeffs:
+        num = (b0 + b1 + b2) ** 2 + (b0 * b2 * phi - (b1 * (b0 + b2) + 4 * b0 * b2)) * phi
+        den = (a0 + a1 + a2) ** 2 + (a0 * a2 * phi - (a1 * (a0 + a2) + 4 * a0 * a2)) * phi
+        gains += 10 * np.log10(np.maximum(num, 1e-12)) - 10 * np.log10(np.maximum(den, 1e-12))
+    return gains
+
+
+def filters_response_db(freqs, filters, fs=DEVICE_SAMPLE_RATE):
+    """Summed dB response of `filters` (any band type) at `freqs`."""
+    coeffs = [biquad_coeffs(f.get("type", "PK"), f["freq"], f["gain"], f["q"], fs)
+              for f in filters]
+    return gains_db(biquad_phi(freqs, fs), [c for c in coeffs if c is not None])
+
+
+def q_to_bw(q):
+    """Q -> bandwidth in octaves."""
+    return 2 * math.asinh(1 / (2 * max(q, 0.001))) / math.log(2)
+
+
+def bw_to_q(bw):
+    """Bandwidth in octaves -> Q (raises OverflowError for absurd widths)."""
+    return 1 / (2 * math.sinh(bw * math.log(2) / 2))
+
+
+# ===========================================================================
+# AutoEQ engine (port of hangout.audio's equalizer.js)
 # ===========================================================================
 
 AUTOEQ_CONFIG = {
@@ -473,9 +569,9 @@ def autoeq_raw_frequencies():
 def parse_frequency_response_file(path):
     """Load a two-column (freq, gain) measurement/target text file.
 
-    Accepts whitespace- or comma-separated columns and ignores blank lines
-    and comment lines (starting with '#', '*' or ';'), which covers common
-    exports such as REW's frequency-response .txt files.
+    Accepts whitespace- or comma-separated columns and ignores blank lines,
+    header lines and comment lines (starting with '#', '*' or ';'), which
+    covers AutoEq's CSVs and common exports such as REW's .txt files.
     """
     points = []
     with open(path, "r") as fh:
@@ -502,195 +598,6 @@ def parse_frequency_response_file(path):
     return points
 
 
-# ---------------------------------------------------------------------------
-# AutoEQ model database (search-by-model, à la autoeq.app)
-# ---------------------------------------------------------------------------
-
-AUTOEQ_DB_CONFIG_PATH = os.path.expanduser("~/.config/eqloader/autoeq_db.json")
-AUTOEQ_LOCAL_CACHE_DIR = os.path.expanduser("~/.cache/eqloader/autoeq_db")
-
-# Public measurement database backing the autoeq.app website. Raw, per-model
-# measurements live under measurements/<source>/data/<category>/<model>.csv
-# as plain "frequency,raw" CSVs — much cleaner to index than results/, which
-# also holds generated EQ outputs, images and impulse-response .wav files.
-AUTOEQ_GITHUB_REPO = "jaakkopasanen/AutoEq"
-AUTOEQ_GITHUB_BRANCH = "master"
-AUTOEQ_GITHUB_API_BASE = f"https://api.github.com/repos/{AUTOEQ_GITHUB_REPO}"
-AUTOEQ_GITHUB_RAW_BASE = (
-    f"https://raw.githubusercontent.com/{AUTOEQ_GITHUB_REPO}/{AUTOEQ_GITHUB_BRANCH}/")
-AUTOEQ_MEASUREMENTS_DIR = "measurements"
-AUTOEQ_TARGETS_DIR = "targets"
-
-# Result files, not raw measurements — skip these when indexing a local folder
-# (a local clone may point at results/ instead of measurements/).
-_AUTOEQ_SKIP_SUFFIXES = ("parametriceq", "graphiceq", "fixedbandeq", " eq")
-
-
-def load_autoeq_db_path():
-    """Return the last-used measurement source ('online' or a folder path)."""
-    try:
-        with open(AUTOEQ_DB_CONFIG_PATH, "r") as fh:
-            path = json.load(fh).get("path")
-        if path == "online" or (path and os.path.isdir(path)):
-            return path
-    except Exception:
-        pass
-    return None
-
-
-def save_autoeq_db_path(path):
-    try:
-        os.makedirs(os.path.dirname(AUTOEQ_DB_CONFIG_PATH), exist_ok=True)
-        with open(AUTOEQ_DB_CONFIG_PATH, "w") as fh:
-            json.dump({"path": path}, fh)
-    except Exception:
-        pass
-
-
-def build_autoeq_model_index(root):
-    """Recursively index .txt measurement files under `root` by model name.
-
-    Works with a local clone of the AutoEQ 'results' database (or any folder
-    of raw frequency-response .txt files), so brand/model subfolders don't
-    matter — only the filename (as the model label) and its containing
-    folder (shown as a disambiguating subtitle) are used.
-    """
-    root = Path(root)
-    index = []
-    for path in root.rglob("*.txt"):
-        if path.stem.lower().endswith(_AUTOEQ_SKIP_SUFFIXES):
-            continue
-        index.append({
-            "label": path.stem,
-            "path": str(path),
-            "subtitle": str(path.relative_to(root).parent),
-            "remote": False,
-        })
-    index.sort(key=lambda e: e["label"].lower())
-    return index
-
-
-def _autoeq_github_get(url):
-    req = urllib.request.Request(
-        url, headers={"Accept": "application/vnd.github+json", "User-Agent": "eqloader"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.load(resp)
-
-
-def _autoeq_github_subtree(dir_path):
-    """Fetch one folder's subtree (by its own tree sha) rather than the
-    whole repo's recursive tree, which is large enough to get truncated by
-    GitHub's API before reaching every file. `dir_path` may be nested
-    ('results/oratory1990'), walked one level at a time since each level's
-    sha is only known from its parent's (non-recursive) listing.
-    """
-    tree_sha = AUTOEQ_GITHUB_BRANCH
-    for part in dir_path.split("/"):
-        listing = _autoeq_github_get(f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{tree_sha}")
-        entry = next(
-            (e for e in listing.get("tree", [])
-             if e.get("path") == part and e.get("type") == "tree"),
-            None)
-        if entry is None:
-            raise RuntimeError(f"'{dir_path}' folder not found in repo")
-        tree_sha = entry["sha"]
-
-    sub = _autoeq_github_get(f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{tree_sha}?recursive=1")
-    if sub.get("truncated"):
-        print(f"Warning: GitHub '{dir_path}' listing was truncated; some entries may be missing.")
-    return sub.get("tree", [])
-
-
-def fetch_autoeq_online_index():
-    """Query the AutoEQ GitHub repo for its list of raw measurement files.
-
-    Only lists file names/paths (two small API calls); the actual
-    measurement content is downloaded lazily, on selection.
-    """
-    tree = _autoeq_github_subtree(AUTOEQ_MEASUREMENTS_DIR)
-    index = []
-    for entry in tree:
-        path = entry.get("path", "")
-        if entry.get("type") != "blob" or "/data/" not in path or not path.endswith(".csv"):
-            continue
-        repo_path = f"{AUTOEQ_MEASUREMENTS_DIR}/{path}"
-        index.append({
-            "label": Path(path).stem,
-            "path": repo_path,  # repo-relative path; used as both remote key and cache key
-            "subtitle": str(Path(path).parent),
-            "remote": True,
-        })
-    index.sort(key=lambda e: e["label"].lower())
-    return index
-
-
-def fetch_autoeq_targets_index():
-    """Query the AutoEQ GitHub repo for its list of named target curves
-    (Harman, diffuse-field, etc.) under targets/ — the same target library
-    hangout.audio's AutoEQ tool picks from, though not necessarily the exact
-    same tilt/adjustment it applies on top.
-    """
-    tree = _autoeq_github_subtree(AUTOEQ_TARGETS_DIR)
-    index = []
-    for entry in tree:
-        path = entry.get("path", "")
-        if entry.get("type") != "blob" or not path.endswith(".csv"):
-            continue
-        repo_path = f"{AUTOEQ_TARGETS_DIR}/{path}"
-        index.append({
-            "label": Path(path).stem,
-            "path": repo_path,
-            "subtitle": "",
-            "remote": True,
-        })
-    index.sort(key=lambda e: e["label"].lower())
-    return index
-
-
-AUTOEQ_RESULTS_DIR = "results"
-
-
-def fetch_autoeq_precomputed_profiles(source, model_stem):
-    """Find ParametricEQ.txt file(s) the AutoEQ project has already computed
-    for `model_stem` under results/<source>/ — a legitimately open,
-    pre-made-profile alternative to running AutoEQ's optimizer yourself.
-    There can be more than one match, since results/ keeps one variant per
-    target preset used (e.g. Harman with/without bass).
-    """
-    tree = _autoeq_github_subtree(f"{AUTOEQ_RESULTS_DIR}/{source}")
-    matches = []
-    for entry in tree:
-        path = entry.get("path", "")
-        if entry.get("type") != "blob" or not path.endswith("ParametricEQ.txt"):
-            continue
-        parent = Path(path).parent
-        if parent.name != model_stem:
-            continue
-        variant = str(parent.parent)
-        matches.append({
-            "label": source if variant in (".", "") else f"{source} / {variant}",
-            "path": f"{AUTOEQ_RESULTS_DIR}/{source}/{path}",
-        })
-    matches.sort(key=lambda m: m["label"])
-    return matches
-
-
-def fetch_autoeq_remote_file(repo_path):
-    """Download (and locally cache) one measurement file from the AutoEQ repo."""
-    cache_path = Path(AUTOEQ_LOCAL_CACHE_DIR) / repo_path
-    if cache_path.is_file():
-        return str(cache_path)
-
-    url = AUTOEQ_GITHUB_RAW_BASE + urllib.parse.quote(repo_path)
-    req = urllib.request.Request(url, headers={"User-Agent": "eqloader"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        content = resp.read()
-
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_bytes(content)
-    return str(cache_path)
-
-
 def autoeq_interp(fv, fr):
     """Interpolate values at fv (ascending) from breakpoints fr (ascending).
 
@@ -711,117 +618,36 @@ def autoeq_interp(fv, fr):
                 found = True
                 break
             elif f0 <= f < f1:
-                v = v0 + (v1 - v0) * (f - f0) / (f1 - f0)
-                out.append((f, v))
+                out.append((f, v0 + (v1 - v0) * (f - f0) / (f1 - f0)))
                 found = True
                 break
-            else:
-                i += 1
+            i += 1
         if not found:
             out.append((f, fr[-1][1]))
     return out
 
 
-def _autoeq_lowshelf(freq, q, gain, sample_rate=None):
-    sample_rate = sample_rate or AUTOEQ_CONFIG["default_sample_rate"]
-    freq = max(1e-6, min(freq / sample_rate, 1))
-    q = max(1e-4, min(q, 1000))
-    gain = max(-40, min(gain, 40))
-
-    w0 = 2 * math.pi * freq
-    sin, cos = math.sin(w0), math.cos(w0)
-    a = 10 ** (gain / 40)
-    alpha = sin / (2 * q)
-    alphamod = 2 * math.sqrt(a) * alpha
-
-    a0 = (a + 1) + (a - 1) * cos + alphamod
-    a1 = -2 * ((a - 1) + (a + 1) * cos)
-    a2 = (a + 1) + (a - 1) * cos - alphamod
-    b0 = a * ((a + 1) - (a - 1) * cos + alphamod)
-    b1 = 2 * a * ((a - 1) - (a + 1) * cos)
-    b2 = a * ((a + 1) - (a - 1) * cos - alphamod)
-    return (1.0, a1 / a0, a2 / a0, b0 / a0, b1 / a0, b2 / a0)
-
-
-def _autoeq_highshelf(freq, q, gain, sample_rate=None):
-    sample_rate = sample_rate or AUTOEQ_CONFIG["default_sample_rate"]
-    freq = max(1e-6, min(freq / sample_rate, 1))
-    q = max(1e-4, min(q, 1000))
-    gain = max(-40, min(gain, 40))
-
-    w0 = 2 * math.pi * freq
-    sin, cos = math.sin(w0), math.cos(w0)
-    a = 10 ** (gain / 40)
-    alpha = sin / (2 * q)
-    alphamod = 2 * math.sqrt(a) * alpha
-
-    a0 = (a + 1) - (a - 1) * cos + alphamod
-    a1 = 2 * ((a - 1) - (a + 1) * cos)
-    a2 = (a + 1) - (a - 1) * cos - alphamod
-    b0 = a * ((a + 1) + (a - 1) * cos + alphamod)
-    b1 = -2 * a * ((a - 1) + (a + 1) * cos)
-    b2 = a * ((a + 1) + (a - 1) * cos - alphamod)
-    return (1.0, a1 / a0, a2 / a0, b0 / a0, b1 / a0, b2 / a0)
-
-
-def _autoeq_peaking(freq, q, gain, sample_rate=None):
-    sample_rate = sample_rate or AUTOEQ_CONFIG["default_sample_rate"]
-    freq = max(1e-6, min(freq / sample_rate, 1))
-    q = max(1e-4, min(q, 1000))
-    gain = max(-40, min(gain, 40))
-
-    w0 = 2 * math.pi * freq
-    sin, cos = math.sin(w0), math.cos(w0)
-    a = 10 ** (gain / 40)
-    alpha = sin / (2 * q)
-
-    a0 = 1 + alpha / a
-    a1 = -2 * cos
-    a2 = 1 - alpha / a
-    b0 = 1 + alpha * a
-    b1 = -2 * cos
-    b2 = 1 - alpha * a
-    return (1.0, a1 / a0, a2 / a0, b0 / a0, b1 / a0, b2 / a0)
-
-
 def autoeq_filters_to_coeffs(filters, sample_rate=None):
-    coeffs = []
-    for f in filters:
-        if not f.get("freq") or not f.get("gain") or not f.get("q"):
-            continue
-        ftype = f.get("type")
-        if ftype == "LSQ":
-            coeffs.append(_autoeq_lowshelf(f["freq"], f["q"], f["gain"], sample_rate))
-        elif ftype == "HSQ":
-            coeffs.append(_autoeq_highshelf(f["freq"], f["q"], f["gain"], sample_rate))
-        elif ftype == "PK":
-            coeffs.append(_autoeq_peaking(f["freq"], f["q"], f["gain"], sample_rate))
-    return coeffs
+    """Like upstream: bands with a zero freq/gain/Q, and LP/HP, are ignored."""
+    fs = sample_rate or AUTOEQ_CONFIG["default_sample_rate"]
+    return [biquad_coeffs(f["type"], f["freq"], f["gain"], f["q"], fs)
+            for f in filters
+            if f.get("freq") and f.get("gain") and f.get("q")
+            and f.get("type") in ("PK", "LSQ", "HSQ")]
 
 
 def autoeq_calc_gains(freqs, coeffs, sample_rate=None):
-    """Vectorized port of `calc_gains`; freqs is a 1-D numpy array."""
-    sample_rate = sample_rate or AUTOEQ_CONFIG["default_sample_rate"]
-    gains = np.zeros(len(freqs))
-    if not coeffs:
-        return gains
-
-    w = 2 * np.pi * freqs / sample_rate
-    phi = 4 * np.sin(w / 2) ** 2
-    for a0, a1, a2, b0, b1, b2 in coeffs:
-        num = (b0 + b1 + b2) ** 2 + (b0 * b2 * phi - (b1 * (b0 + b2) + 4 * b0 * b2)) * phi
-        den = (a0 + a1 + a2) ** 2 + (a0 * a2 * phi - (a1 * (a0 + a2) + 4 * a0 * a2)) * phi
-        gains += 10 * np.log10(np.maximum(num, 1e-12)) - 10 * np.log10(np.maximum(den, 1e-12))
-    return gains
+    fs = sample_rate or AUTOEQ_CONFIG["default_sample_rate"]
+    return gains_db(biquad_phi(freqs, fs), coeffs)
 
 
 def autoeq_apply(fr, filters, sample_rate=None):
-    """fr: list of (freq, dB). Returns a new list of (freq, dB) with filters applied."""
-    freqs = np.array([f for f, _ in fr], dtype=float)
+    """Curve `fr` with `filters` applied."""
+    freqs = [f for f, _ in fr]
     values = np.array([v for _, v in fr], dtype=float)
-    coeffs = autoeq_filters_to_coeffs(filters, sample_rate)
-    values = values + autoeq_calc_gains(freqs, coeffs, sample_rate)
-    return list(zip((f for f, _ in fr), values.tolist()))
+    values = values + autoeq_calc_gains(
+        freqs, autoeq_filters_to_coeffs(filters, sample_rate), sample_rate)
+    return list(zip(freqs, values.tolist()))
 
 
 def autoeq_calc_preamp(fr1, fr2):
@@ -831,11 +657,14 @@ def autoeq_calc_preamp(fr1, fr2):
     return min(0.0, math.floor(-max_boost * 10) / 10)
 
 
-def autoeq_calc_distance(fr1, fr2):
-    v1 = np.array([v for _, v in fr1])
-    v2 = np.array([v for _, v in fr2])
-    d = np.abs(v1 - v2)
+def _distance(values, target):
+    """Mean absolute deviation, ignoring deviations under 0.1 dB."""
+    d = np.abs(values - target)
     return float(np.mean(np.where(d >= 0.1, d, 0.0)))
+
+
+def autoeq_calc_distance(fr1, fr2):
+    return _distance(np.array([v for _, v in fr1]), np.array([v for _, v in fr2]))
 
 
 def autoeq_freq_unit(freq):
@@ -849,31 +678,31 @@ def autoeq_freq_unit(freq):
 
 
 def autoeq_strip(filters):
+    """Round bands to device-friendly values and clamp to the optimizer's ranges."""
     min_q, max_q = AUTOEQ_CONFIG["optimize_q_range"]
     min_gain, max_gain = AUTOEQ_CONFIG["optimize_gain_range"]
-    result = []
-    for f in filters:
-        unit = autoeq_freq_unit(f["freq"])
-        result.append({
+    return [
+        {
             "type": f["type"],
-            "freq": math.floor(f["freq"] - f["freq"] % unit),
+            "freq": math.floor(f["freq"] - f["freq"] % autoeq_freq_unit(f["freq"])),
             "q": min(max(math.floor(f["q"] * 10) / 10, min_q), max_q),
             "gain": min(max(math.floor(f["gain"] * 10) / 10, min_gain), max_gain),
-        })
-    return result
+        }
+        for f in filters
+    ]
 
 
 def autoeq_search_candidates(fr, fr_target, threshold):
+    """One PK candidate per contiguous region where `fr` deviates from the
+    target by >= threshold, centred on it and sized to its width."""
     state = 0  # 1: peak, 0: matched, -1: dip
     start_index = -1
     candidates = []
     min_freq, max_freq = AUTOEQ_CONFIG["autoeq_range"]
 
     for i, (f, v0) in enumerate(fr):
-        v1 = fr_target[i][1]
-        delta = v0 - v1
-        delta_abs = abs(delta)
-        next_state = 0 if delta_abs < threshold else (1 if delta > 0 else -1)
+        delta = v0 - fr_target[i][1]
+        next_state = 0 if abs(delta) < threshold else (1 if delta > 0 else -1)
         if next_state == state:
             continue
 
@@ -883,72 +712,89 @@ def autoeq_search_candidates(fr, fr_target, threshold):
         # (A region still open at the top of the grid is dropped, as upstream.)
         if state != 0 and start_index >= 0:
             start = fr[start_index][0]
-            end = f
-            center = math.sqrt(start * end)
+            center = math.sqrt(start * f)
             gain = (
                 autoeq_interp([center], fr_target[start_index:i + 1])[0][1] -
                 autoeq_interp([center], fr[start_index:i + 1])[0][1]
             )
-            q = center / (end - start)
             if min_freq <= center <= max_freq:
-                candidates.append({"type": "PK", "freq": center, "q": q, "gain": gain})
+                candidates.append(
+                    {"type": "PK", "freq": center, "q": center / (f - start), "gain": gain})
         start_index = i if next_state != 0 else -1
         state = next_state
 
     return candidates
 
 
-def autoeq_optimize(fr, fr_target, filters, iteration, dir_=False):
-    filters = autoeq_strip(filters)
+class _AutoEqFit:
+    """A measurement and target on one grid, as arrays, so the optimizer's
+    inner loop evaluates candidate filters without per-call list conversions."""
+
+    def __init__(self, fr, fr_target):
+        fs = AUTOEQ_CONFIG["default_sample_rate"]
+        self.values = np.array([v for _, v in fr], dtype=float)
+        self.target = np.array([v for _, v in fr_target], dtype=float)
+        self.phi = biquad_phi([f for f, _ in fr], fs)
+
+    def apply(self, values, filters):
+        return values + gains_db(self.phi, autoeq_filters_to_coeffs(filters))
+
+    def distance(self, filters, values=None):
+        """Distance to target after applying `filters` to `values` (default: the measurement)."""
+        return _distance(self.apply(self.values if values is None else values, filters),
+                         self.target)
+
+
+def _refine_pass(fit, filters, iteration, reverse):
+    """Greedy local search over each band's freq/Q/gain, one band at a time."""
     min_freq, max_freq = AUTOEQ_CONFIG["autoeq_range"]
     min_q, max_q = AUTOEQ_CONFIG["optimize_q_range"]
     min_gain, max_gain = AUTOEQ_CONFIG["optimize_gain_range"]
     max_df, max_dq, max_dg, step_df, step_dq, step_dg = (
         AUTOEQ_CONFIG["optimize_deltas"][iteration])
 
-    indices = range(len(filters) - 1, -1, -1) if dir_ else range(len(filters))
-
-    for i in indices:
+    for i in (reversed(range(len(filters))) if reverse else range(len(filters))):
         f = filters[i]
-        fr1 = autoeq_apply(fr, [ff for fi, ff in enumerate(filters) if fi != i])
-        fr2 = autoeq_apply(fr1, [f])
+        others = fit.apply(fit.values, filters[:i] + filters[i + 1:])
         best_filter = dict(f)
-        best_distance = autoeq_calc_distance(fr2, fr_target)
+        best_distance = fit.distance([f], others)
 
-        def test_new_filter(df, dq, dg):
+        def try_step(df, dq, dg):
             nonlocal best_filter, best_distance
             freq = f["freq"] + df * autoeq_freq_unit(f["freq"]) * step_df
             q = f["q"] + dq * step_dq
             gain = f["gain"] + dg * step_dg
-            if (freq < min_freq or freq > max_freq or q < min_q or q > max_q
-                    or gain < min_gain or gain > max_gain):
+            if not (min_freq <= freq <= max_freq and min_q <= q <= max_q
+                    and min_gain <= gain <= max_gain):
                 return False
-            new_filter = {"type": f["type"], "freq": freq, "q": q, "gain": gain}
-            new_distance = autoeq_calc_distance(
-                autoeq_apply(fr1, [new_filter]), fr_target)
-            if new_distance < best_distance:
-                best_filter = new_filter
-                best_distance = new_distance
+            candidate = {"type": f["type"], "freq": freq, "q": q, "gain": gain}
+            distance = fit.distance([candidate], others)
+            if distance < best_distance:
+                best_filter, best_distance = candidate, distance
                 return True
             return False
 
+        # Loop bounds (including their asymmetry) are upstream's.
         for df in range(-max_df, max_df):
-            for dq in range(max_dq - 1, -max_dq - 1, -1):
+            for dq in range(max_dq - 1, -max_dq - 1, -1):  # smaller Q (wider) first
                 for dg in range(1, max_dg):
-                    if not test_new_filter(df, dq, dg):
+                    if not try_step(df, dq, dg):
                         break
                 for dg in range(-1, -max_dg - 1, -1):
-                    if not test_new_filter(df, dq, dg):
+                    if not try_step(df, dq, dg):
                         break
 
         filters[i] = best_filter
 
-    if not dir_:
-        return autoeq_optimize(fr, fr_target, filters, iteration, True)
 
-    filters = sorted(filters, key=lambda x: x["freq"])
+def _optimize(fit, filters, iteration):
+    """Refine forward then backward, then merge near-duplicates and drop
+    bands that don't help."""
+    for reverse in (False, True):
+        filters = autoeq_strip(filters)
+        _refine_pass(fit, filters, iteration, reverse)
+    filters.sort(key=lambda x: x["freq"])
 
-    # Merge close filters.
     i = 0
     while i < len(filters) - 1:
         f1, f2 = filters[i], filters[i + 1]
@@ -959,61 +805,59 @@ def autoeq_optimize(fr, fr_target, filters, iteration, dir_=False):
         else:
             i += 1
 
-    # Remove unnecessary filters.
-    best_distance = autoeq_calc_distance(autoeq_apply(fr, filters), fr_target)
+    best_distance = fit.distance(filters)
     i = 0
     while i < len(filters):
         if abs(filters[i]["gain"]) <= 0.1:
             del filters[i]
             continue
-        remaining = [ff for fi, ff in enumerate(filters) if fi != i]
-        new_distance = autoeq_calc_distance(autoeq_apply(fr, remaining), fr_target)
-        if new_distance < best_distance:
+        distance = fit.distance(filters[:i] + filters[i + 1:])
+        if distance < best_distance:
             del filters[i]
-            best_distance = new_distance
+            best_distance = distance
         else:
             i += 1
-
     return filters
 
 
-def autoeq_run(fr, fr_target, max_filters):
-    """Compute PK filters that reshape `fr` towards `fr_target`.
+def autoeq_optimize(fr, fr_target, filters, iteration):
+    return _optimize(_AutoEqFit(fr, fr_target), filters, iteration)
 
-    `fr` / `fr_target`: list of (freq, dB) on the same, ascending frequency grid.
+
+def autoeq_run(fr, fr_target, max_filters):
+    """Compute up to `max_filters` PK filters that reshape `fr` towards
+    `fr_target` (curves on the same ascending grid, level-aligned).
+
+    Two batches, as upstream: first the widest deviations below the treble,
+    then whatever remains, then a joint refinement of all bands.
     """
     if max_filters <= 0:
         return []
-    deltas = AUTOEQ_CONFIG["optimize_deltas"]
-    first_batch_size = max(math.floor(max_filters / 2) - 1, 1)
+    iterations = range(len(AUTOEQ_CONFIG["optimize_deltas"]))
 
-    first_candidates = autoeq_search_candidates(fr, fr_target, 1)
-    first_filters = sorted(
-        sorted(
-            (c for c in first_candidates
-             if c["freq"] <= AUTOEQ_CONFIG["treble_start_from"]),
-            key=lambda c: c["q"],
-        )[:first_batch_size],
-        key=lambda c: c["freq"],
-    )
-    for i in range(len(deltas)):
-        first_filters = autoeq_optimize(fr, fr_target, first_filters, i)
+    def widest(candidates, count):
+        return sorted(sorted(candidates, key=lambda c: c["q"])[:count],
+                      key=lambda c: c["freq"])
 
-    second_fr = autoeq_apply(fr, first_filters)
-    second_batch_size = max_filters - len(first_filters)
-    second_candidates = autoeq_search_candidates(second_fr, fr_target, 0.5)
-    second_filters = sorted(
-        sorted(second_candidates, key=lambda c: c["q"])[:second_batch_size],
-        key=lambda c: c["freq"],
-    )
-    for i in range(len(deltas)):
-        second_filters = autoeq_optimize(second_fr, fr_target, second_filters, i)
+    fit = _AutoEqFit(fr, fr_target)
+    first = widest(
+        [c for c in autoeq_search_candidates(fr, fr_target, 1)
+         if c["freq"] <= AUTOEQ_CONFIG["treble_start_from"]],
+        max(math.floor(max_filters / 2) - 1, 1))
+    for i in iterations:
+        first = _optimize(fit, first, i)
 
-    all_filters = first_filters + second_filters
-    for i in range(len(deltas)):
-        all_filters = autoeq_optimize(fr, fr_target, all_filters, i)
+    second_fr = autoeq_apply(fr, first)
+    second_fit = _AutoEqFit(second_fr, fr_target)
+    second = widest(autoeq_search_candidates(second_fr, fr_target, 0.5),
+                    max_filters - len(first))
+    for i in iterations:
+        second = _optimize(second_fit, second, i)
 
-    return autoeq_strip(all_filters)
+    combined = first + second
+    for i in iterations:
+        combined = _optimize(fit, combined, i)
+    return autoeq_strip(combined)
 
 
 # ---------------------------------------------------------------------------
@@ -1056,7 +900,7 @@ _ISO226_T_F = [
 ]
 
 # Diffuse-field correction curve, ~1/48 octave from 19.4806 Hz, as used by
-# hangout.audio's init_normalize() (raw values, before the "-7" dB shift).
+# CrinGraph's init_normalize() (raw values, before the "-7" dB shift).
 _FREE_FIELD_RAW = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0725, 0.1, 0.1,
@@ -1106,22 +950,21 @@ def _iso226_init_normalize(freqs):
     """Interpolated ISO 226:2003 loudness parameters at each frequency."""
     par = []
     ff = []
-    p_f, p_a, p_lu, p_tf = _ISO226_F, _ISO226_A_F, _ISO226_L_U, _ISO226_T_F
     i = 0
-    n = len(p_f)
+    n = len(_ISO226_F)
     for f in freqs:
-        if i < n and f >= p_f[i]:
+        if i < n and f >= _ISO226_F[i]:
             i += 1
         i0 = max(0, i - 1)
         i1 = min(i, n - 1)
         if i0 == i1:
-            a, lu, tf = p_a[i0], p_lu[i0], p_tf[i0]
+            a, lu, tf = _ISO226_A_F[i0], _ISO226_L_U[i0], _ISO226_T_F[i0]
         else:
-            l0, l1, lf = math.log(p_f[i0]), math.log(p_f[i1]), math.log(f)
-            frac = (lf - l0) / (l1 - l0)
-            a = p_a[i0] + frac * (p_a[i1] - p_a[i0])
-            lu = p_lu[i0] + frac * (p_lu[i1] - p_lu[i0])
-            tf = p_tf[i0] + frac * (p_tf[i1] - p_tf[i0])
+            l0, l1 = math.log(_ISO226_F[i0]), math.log(_ISO226_F[i1])
+            frac = (math.log(f) - l0) / (l1 - l0)
+            a = _ISO226_A_F[i0] + frac * (_ISO226_A_F[i1] - _ISO226_A_F[i0])
+            lu = _ISO226_L_U[i0] + frac * (_ISO226_L_U[i1] - _ISO226_L_U[i0])
+            tf = _ISO226_T_F[i0] + frac * (_ISO226_T_F[i1] - _ISO226_T_F[i0])
         m = a * (math.log10(4) - 10 + lu / 10)
         k = (0.005076 / (10 ** m)) - (10 ** (a * tf / 10))
         c = (10 ** (9.4 + 4 * m)) / len(freqs)
@@ -1132,13 +975,12 @@ def _iso226_init_normalize(freqs):
 
 
 def iso226_find_offset(curve, target_phon=0.0):
-    """dB offset that brings `curve` (list of (freq, dB)) to `target_phon` loudness."""
-    freqs = [f for f, _ in curve]
+    """dB offset that brings `curve` to `target_phon` loudness (Newton's method)."""
     values = [v for _, v in curve]
-    par, ff = _iso226_init_normalize(freqs)
+    par, ff = _iso226_init_normalize([f for f, _ in curve])
     l10 = math.log(10) / 10
 
-    def get_step(offset):
+    def step(offset):
         v_total = 0.0
         d_total = 0.0
         for (a, k, c), fr_val, ff_val in zip(par, values, ff):
@@ -1153,7 +995,7 @@ def iso226_find_offset(curve, target_phon=0.0):
 
     x = 0.0
     for _ in range(100):  # converges in a handful of steps; capped as a safety net
-        dx = get_step(x)
+        dx = step(x)
         x -= dx
         if abs(dx) <= 0.01:
             break
@@ -1166,215 +1008,887 @@ def autoeq_loudness_normalize(curve):
     return [(f, v + offset) for f, v in curve]
 
 
+def autoeq_compute(measurement, target_points, max_filters):
+    """Full AutoEQ pipeline: returns (filters, preamp_db) that bring
+    `measurement` towards `target_points` (None = flat). Both inputs are
+    (freq, dB) point lists at any resolution."""
+    freqs = autoeq_raw_frequencies()
+    fr = autoeq_loudness_normalize(autoeq_interp(freqs, measurement))
+    fr_target = autoeq_loudness_normalize(
+        [(f, 0.0) for f in freqs] if target_points is None
+        else autoeq_interp(freqs, target_points))
+
+    filters = autoeq_run(fr, fr_target, max_filters)
+    preamp = autoeq_calc_preamp(fr, autoeq_apply(fr, filters))
+    filters = [{"type": f["type"], "freq": round(f["freq"], 1),
+                "gain": round(f["gain"], 2), "q": round(f["q"], 3)} for f in filters]
+    return filters, preamp
+
+
 # ===========================================================================
-# GUI helpers
+# AutoEQ measurement database (online AutoEq repo or a local folder)
+# ===========================================================================
+#
+# Index entries are {"label", "path", "subtitle", "remote"}: `path` is a local
+# file, or for remote entries a repo-relative path fetched (and cached) by
+# fetch_autoeq_remote_file().
+
+AUTOEQ_DB_CONFIG_PATH = os.path.expanduser("~/.config/eqloader/autoeq_db.json")
+AUTOEQ_LOCAL_CACHE_DIR = os.path.expanduser("~/.cache/eqloader/autoeq_db")
+
+# Raw per-model measurements live under measurements/<source>/data/<category>/
+# <model>.csv as plain "frequency,raw" CSVs; results/<source>/ holds the
+# project's own computed EQs.
+AUTOEQ_GITHUB_REPO = "jaakkopasanen/AutoEq"
+AUTOEQ_GITHUB_BRANCH = "master"
+AUTOEQ_GITHUB_API_BASE = f"https://api.github.com/repos/{AUTOEQ_GITHUB_REPO}"
+AUTOEQ_GITHUB_RAW_BASE = (
+    f"https://raw.githubusercontent.com/{AUTOEQ_GITHUB_REPO}/{AUTOEQ_GITHUB_BRANCH}/")
+AUTOEQ_MEASUREMENTS_DIR = "measurements"
+AUTOEQ_TARGETS_DIR = "targets"
+AUTOEQ_RESULTS_DIR = "results"
+
+# Result files, not raw measurements — skip these when indexing a local folder
+# (a local clone may point at results/ instead of measurements/).
+_AUTOEQ_SKIP_SUFFIXES = ("parametriceq", "graphiceq", "fixedbandeq", " eq")
+
+
+def load_autoeq_db_path():
+    """Return the last-used measurement source ('online' or a folder path)."""
+    try:
+        with open(AUTOEQ_DB_CONFIG_PATH, "r") as fh:
+            path = json.load(fh).get("path")
+        if path == "online" or (path and os.path.isdir(path)):
+            return path
+    except Exception:
+        pass
+    return None
+
+
+def save_autoeq_db_path(path):
+    try:
+        os.makedirs(os.path.dirname(AUTOEQ_DB_CONFIG_PATH), exist_ok=True)
+        with open(AUTOEQ_DB_CONFIG_PATH, "w") as fh:
+            json.dump({"path": path}, fh)
+    except Exception:
+        pass
+
+
+def _sorted_index(entries):
+    return sorted(entries, key=lambda e: e["label"].lower())
+
+
+def build_autoeq_model_index(root):
+    """Recursively index measurement .txt/.csv files under `root` by model
+    name (the file name); the containing folder becomes the subtitle."""
+    root = Path(root)
+    return _sorted_index(
+        {
+            "label": path.stem,
+            "path": str(path),
+            "subtitle": str(path.relative_to(root).parent),
+            "remote": False,
+        }
+        for pattern in ("*.txt", "*.csv")
+        for path in root.rglob(pattern)
+        if not path.stem.lower().endswith(_AUTOEQ_SKIP_SUFFIXES)
+    )
+
+
+def _autoeq_github_get(url):
+    req = urllib.request.Request(
+        url, headers={"Accept": "application/vnd.github+json", "User-Agent": "eqloader"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.load(resp)
+
+
+def _autoeq_github_subtree(dir_path):
+    """Fetch one folder's subtree (by its own tree sha) rather than the
+    whole repo's recursive tree, which is large enough to get truncated by
+    GitHub's API before reaching every file. `dir_path` may be nested
+    ('results/oratory1990'), walked one level at a time since each level's
+    sha is only known from its parent's (non-recursive) listing.
+    """
+    tree_sha = AUTOEQ_GITHUB_BRANCH
+    for part in dir_path.split("/"):
+        listing = _autoeq_github_get(f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{tree_sha}")
+        entry = next(
+            (e for e in listing.get("tree", [])
+             if e.get("path") == part and e.get("type") == "tree"),
+            None)
+        if entry is None:
+            raise RuntimeError(f"'{dir_path}' folder not found in repo")
+        tree_sha = entry["sha"]
+
+    sub = _autoeq_github_get(f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{tree_sha}?recursive=1")
+    if sub.get("truncated"):
+        print(f"Warning: GitHub '{dir_path}' listing was truncated; some entries may be missing.")
+    return [e for e in sub.get("tree", []) if e.get("type") == "blob"]
+
+
+def fetch_autoeq_online_index():
+    """List the AutoEq repo's raw measurement files (names only; content is
+    downloaded lazily, on selection)."""
+    return _sorted_index(
+        {
+            "label": Path(e["path"]).stem,
+            "path": f"{AUTOEQ_MEASUREMENTS_DIR}/{e['path']}",
+            "subtitle": str(Path(e["path"]).parent),
+            "remote": True,
+        }
+        for e in _autoeq_github_subtree(AUTOEQ_MEASUREMENTS_DIR)
+        if "/data/" in e["path"] and e["path"].endswith(".csv")
+    )
+
+
+def fetch_autoeq_targets_index():
+    """List the AutoEq repo's named target curves (Harman, diffuse-field, ...)."""
+    return _sorted_index(
+        {
+            "label": Path(e["path"]).stem,
+            "path": f"{AUTOEQ_TARGETS_DIR}/{e['path']}",
+            "subtitle": "",
+            "remote": True,
+        }
+        for e in _autoeq_github_subtree(AUTOEQ_TARGETS_DIR)
+        if e["path"].endswith(".csv")
+    )
+
+
+def fetch_autoeq_precomputed_profiles(source, model_stem):
+    """ParametricEQ.txt file(s) the AutoEq project already computed for
+    `model_stem` under results/<source>/ — one per target variant it used."""
+    matches = []
+    for e in _autoeq_github_subtree(f"{AUTOEQ_RESULTS_DIR}/{source}"):
+        parent = Path(e["path"]).parent
+        if not e["path"].endswith("ParametricEQ.txt") or parent.name != model_stem:
+            continue
+        variant = str(parent.parent)
+        matches.append({
+            "label": source if variant in (".", "") else f"{source} / {variant}",
+            "path": f"{AUTOEQ_RESULTS_DIR}/{source}/{e['path']}",
+            "subtitle": "",
+            "remote": True,
+        })
+    return _sorted_index(matches)
+
+
+def fetch_autoeq_remote_file(repo_path):
+    """Download (and locally cache) one file from the AutoEq repo; returns its local path."""
+    cache_path = Path(AUTOEQ_LOCAL_CACHE_DIR) / repo_path
+    if cache_path.is_file():
+        return str(cache_path)
+
+    url = AUTOEQ_GITHUB_RAW_BASE + urllib.parse.quote(repo_path)
+    req = urllib.request.Request(url, headers={"User-Agent": "eqloader"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        content = resp.read()
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(content)
+    return str(cache_path)
+
+
+# ===========================================================================
+# GUI toolkit: theme, dialogs, small widgets
 # ===========================================================================
 
-class StdoutRedirector:
-    """Thread-safe write target that feeds a queue."""
+# "Instrument panel": graphite chassis, two-LED accent.
+THEME = {
+    "chassis":   "#14161A",  # deep graphite base
+    "panel":     "#1C1F26",  # raised frame / surface
+    "input":     "#262A33",  # entries, hover
+    "line":      "#2E333D",  # hairline borders / grid
+    "ink":       "#E6E9EF",  # primary text
+    "muted":     "#8A93A3",  # secondary labels
+    "accent":    "#4ED0C4",  # cyan signal / idle trace
+    "accent_dk": "#2C8F87",  # pressed / darker cyan
+    "active":    "#F0A93B",  # amber, selected band
+    "danger":    "#E5687A",  # destructive action
+}
 
-    def __init__(self, q):
+MONO_FONTS = ("JetBrains Mono", "DejaVu Sans Mono", "Consolas", "Menlo",
+              "Courier New", "monospace")
+UI_FONTS = ("Inter", "Segoe UI", "Helvetica Neue", "DejaVu Sans", "sans-serif")
+
+NEW_BAND = {"type": "PK", "freq": 1000.0, "gain": 0.0, "q": 1.0}
+GRAPH_MIN_HEIGHT = 150  # px; below this the graph is auto-hidden
+GRAPH_GAIN_LIMIT = 15   # dB; graph y-range and drag clamp
+FILE_TYPES_PROFILE = [("Text files", "*.txt"), ("All files", "*.*")]
+FILE_TYPES_CURVE = [("Text/CSV files", "*.txt *.csv"), ("All files", "*.*")]
+
+
+def _pick_font(root, families):
+    """Return the first installed font family, else the last fallback."""
+    try:
+        import tkinter.font as tkfont
+        available = {f.lower() for f in tkfont.families(root)}
+        for fam in families:
+            if fam.lower() in available:
+                return fam
+    except Exception:
+        pass
+    return families[-1]
+
+
+def _install_theme(root):
+    """Skin every ttk widget as a graphite instrument panel; returns (ui_font, mono_font)."""
+    c = THEME
+    font_ui = _pick_font(root, UI_FONTS)
+    font_mono = _pick_font(root, MONO_FONTS)
+    base_font = (font_ui, 10)
+    root.configure(bg=c["chassis"])
+
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")  # the one built-in theme that honours colour overrides
+    except tk.TclError:
+        pass
+
+    style.configure(".", background=c["chassis"], foreground=c["ink"],
+                    fieldbackground=c["input"], bordercolor=c["line"],
+                    lightcolor=c["line"], darkcolor=c["line"],
+                    troughcolor=c["panel"], font=base_font)
+    style.configure("TFrame", background=c["chassis"])
+    style.configure("TLabel", background=c["chassis"], foreground=c["ink"], font=base_font)
+    style.configure("Muted.TLabel", background=c["chassis"],
+                    foreground=c["muted"], font=(font_ui, 9))
+    style.configure("TLabelframe", background=c["chassis"],
+                    bordercolor=c["line"], relief="solid", borderwidth=1)
+    style.configure("TLabelframe.Label", background=c["chassis"],
+                    foreground=c["muted"], font=(font_ui, 9, "bold"))
+
+    for widget in ("TEntry", "TSpinbox", "TCombobox"):
+        style.configure(widget, background=c["input"],
+                        fieldbackground=c["input"], foreground=c["ink"],
+                        insertcolor=c["accent"], bordercolor=c["line"],
+                        arrowcolor=c["muted"], padding=4)
+        style.map(widget, bordercolor=[("focus", c["accent"])],
+                  foreground=[("disabled", c["muted"])])
+
+    # readonly combobox field needs explicit state mappings.
+    style.map("TCombobox",
+              fieldbackground=[("readonly", c["input"]), ("disabled", c["panel"])],
+              foreground=[("readonly", c["ink"]), ("disabled", c["muted"])],
+              selectbackground=[("readonly", c["input"])],
+              selectforeground=[("readonly", c["ink"])],
+              background=[("focus", c["input"]), ("active", c["line"]),
+                          ("!focus", c["input"])],
+              arrowcolor=[("focus", c["accent"]), ("active", c["accent"]),
+                          ("!focus", c["muted"])])
+
+    style.configure("TButton", background=c["input"], foreground=c["ink"],
+                    bordercolor=c["line"], focuscolor=c["accent"],
+                    relief="flat", padding=(10, 6), font=base_font)
+    style.map("TButton",
+              background=[("pressed", c["accent_dk"]), ("active", c["line"])],
+              foreground=[("pressed", c["chassis"])],
+              bordercolor=[("active", c["accent"])])
+
+    style.configure("Accent.TButton", background=c["accent"],
+                    foreground=c["chassis"], relief="flat",
+                    padding=(10, 6), font=(font_ui, 10, "bold"))
+    style.map("Accent.TButton",
+              background=[("pressed", c["accent_dk"]), ("active", c["accent_dk"])],
+              foreground=[("active", c["chassis"])])
+
+    style.configure("Danger.TButton", background=c["input"],
+                    foreground=c["danger"], relief="flat", padding=(10, 6))
+    style.map("Danger.TButton",
+              background=[("active", c["danger"]), ("pressed", c["danger"])],
+              foreground=[("active", c["chassis"]), ("pressed", c["chassis"])])
+
+    style.configure("TCheckbutton", background=c["chassis"],
+                    foreground=c["ink"], focuscolor=c["accent"])
+    style.map("TCheckbutton", background=[("active", c["chassis"])],
+              indicatorcolor=[("selected", c["accent"]), ("!selected", c["input"])])
+
+    for sb in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+        style.configure(sb, background=c["input"], troughcolor=c["panel"],
+                        bordercolor=c["panel"], arrowcolor=c["muted"])
+        style.map(sb, background=[("active", c["line"])])
+
+    # Combobox dropdown popup is a plain tk.Listbox — style via option_add.
+    root.option_add("*TCombobox*Listbox.background", c["input"])
+    root.option_add("*TCombobox*Listbox.foreground", c["ink"])
+    root.option_add("*TCombobox*Listbox.selectBackground", c["accent"])
+    root.option_add("*TCombobox*Listbox.selectForeground", c["chassis"])
+    root.option_add("*TCombobox*Listbox.font", (font_ui, 10))
+    return font_ui, font_mono
+
+
+def _listbox(parent, font_ui, **kwargs):
+    """A classic tk.Listbox (no ttk equivalent) themed to match."""
+    c = THEME
+    return tk.Listbox(
+        parent, bg=c["panel"], fg=c["ink"], selectbackground=c["accent"],
+        selectforeground=c["chassis"], highlightthickness=1,
+        highlightbackground=c["line"], highlightcolor=c["accent"],
+        borderwidth=0, activestyle="none", font=(font_ui, 10), **kwargs)
+
+
+def _add_tooltip(widget, text, font_ui):
+    """Show a small hover tooltip (used for keyboard-shortcut hints)."""
+    state = {"win": None}
+
+    def show(_e=None):
+        if state["win"] is not None or not text:
+            return
+        win = tk.Toplevel(widget)
+        win.wm_overrideredirect(True)
+        win.wm_geometry(f"+{widget.winfo_rootx() + 10}"
+                        f"+{widget.winfo_rooty() + widget.winfo_height() + 4}")
+        tk.Label(win, text=text, bg=THEME["input"], fg=THEME["ink"],
+                 font=(font_ui, 9), padx=6, pady=2,
+                 highlightthickness=1, highlightbackground=THEME["line"]).pack()
+        state["win"] = win
+
+    def hide(_e=None):
+        if state["win"] is not None:
+            state["win"].destroy()
+            state["win"] = None
+
+    widget.bind("<Enter>", show, add="+")
+    widget.bind("<Leave>", hide, add="+")
+    widget.bind("<Destroy>", hide, add="+")
+
+
+def _dialog(parent, title, resizable=False):
+    dlg = tk.Toplevel(parent)
+    dlg.title(title)
+    dlg.configure(bg=THEME["chassis"])
+    dlg.transient(parent)
+    if not resizable:
+        dlg.resizable(False, False)
+    return dlg
+
+
+def _show_modal(parent, dlg, focus=None):
+    """Grab input and place `dlg` centred over the upper third of `parent`."""
+    dlg.grab_set()
+    dlg.update_idletasks()
+    x = parent.winfo_rootx() + (parent.winfo_width() - dlg.winfo_width()) // 2
+    y = parent.winfo_rooty() + (parent.winfo_height() - dlg.winfo_height()) // 3
+    dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+    if focus is not None:
+        focus.focus_set()
+
+
+def ask_choice(parent, title, message, buttons, *, wraplength=380, enter=None, focus=None):
+    """Modal message with a row of buttons; blocks until one is clicked.
+
+    `buttons` are (label, value, ttk_style). Returns the clicked button's
+    value, or None on Escape / closing the window. `enter` is the value Return
+    picks; `focus` the label of the button that gets keyboard focus.
+    """
+    dlg = _dialog(parent, title)
+    ttk.Label(dlg, text=message, wraplength=wraplength, justify="left").pack(
+        padx=24, pady=(20, 16))
+    row = ttk.Frame(dlg)
+    row.pack(padx=16, pady=(0, 18))
+
+    result = {"value": None}
+
+    def choose(value):
+        result["value"] = value
+        dlg.destroy()
+
+    focus_btn = None
+    for label, value, style in buttons:
+        btn = ttk.Button(row, text=label, style=style, command=lambda v=value: choose(v))
+        btn.pack(side="left", padx=4)
+        if label == focus:
+            focus_btn = btn
+
+    dlg.bind("<Escape>", lambda _e: choose(None))
+    if enter is not None:
+        dlg.bind("<Return>", lambda _e: choose(enter))
+        dlg.bind("<KP_Enter>", lambda _e: choose(enter))
+    dlg.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+    _show_modal(parent, dlg, focus_btn)
+    parent.wait_window(dlg)
+    return result["value"]
+
+
+def busy_dialog(parent, title, message):
+    """Modal, not user-closable spinner; the caller destroys it when done."""
+    dlg = _dialog(parent, title)
+    ttk.Label(dlg, text=message, wraplength=320, justify="left").pack(padx=24, pady=(20, 10))
+    bar = ttk.Progressbar(dlg, mode="indeterminate", length=280)
+    bar.pack(padx=24, pady=(0, 20))
+    bar.start(12)
+    dlg.protocol("WM_DELETE_WINDOW", lambda: None)
+    _show_modal(parent, dlg)
+    return dlg
+
+
+class SearchDialog:
+    """Modal type-to-filter list over index entries (see the AutoEQ database
+    section). Picking a remote entry downloads it first. run() returns
+    (local_path, entry), or (None, None) if cancelled."""
+
+    MAX_ROWS = 300
+
+    def __init__(self, app, title, size, min_size, get_items,
+                 show_subtitle=False, status_suffix=lambda: ""):
+        self.app = app
+        self.get_items = get_items
+        self.show_subtitle = show_subtitle
+        self.status_suffix = status_suffix
+        self.result = (None, None)
+        self.filtered = []
+
+        self.dlg = dlg = _dialog(app, title, resizable=True)
+        dlg.geometry(size)
+        dlg.minsize(*min_size)
+
+        top = ttk.Frame(dlg)
+        top.pack(fill="x", padx=12, pady=(12, 6))
+        ttk.Label(top, text="Search:").pack(side="left")
+        self.query = tk.StringVar()
+        self.entry = ttk.Entry(top, textvariable=self.query)
+        self.entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        list_frame = ttk.Frame(dlg)
+        list_frame.pack(fill="both", expand=True, padx=12, pady=6)
+        self.listbox = _listbox(list_frame, app.font_ui)
+        self.listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.listbox.configure(yscrollcommand=scrollbar.set)
+
+        self.status = tk.StringVar()
+        ttk.Label(dlg, textvariable=self.status, style="Muted.TLabel").pack(anchor="w", padx=12)
+
+        self.button_row = ttk.Frame(dlg)
+        self.button_row.pack(fill="x", padx=12, pady=(6, 12))
+        ttk.Button(self.button_row, text="Cancel", command=dlg.destroy).pack(side="right", padx=4)
+        self.select_btn = ttk.Button(self.button_row, text="Select",
+                                     style="Accent.TButton", command=self.choose)
+        self.select_btn.pack(side="right", padx=4)
+
+        self.query.trace_add("write", lambda *_: self.refresh())
+        self.listbox.bind("<Double-Button-1>", lambda _e: self.choose())
+        self.entry.bind("<Return>", lambda _e: self.choose())
+        self.entry.bind("<Down>", lambda _e: self.listbox.focus_set())
+        dlg.bind("<Escape>", lambda _e: dlg.destroy())
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+
+    def add_button(self, text, command):
+        ttk.Button(self.button_row, text=text, command=command).pack(side="left", padx=(0, 6))
+
+    def refresh(self):
+        terms = self.query.get().strip().lower().split()
+        self.filtered = [
+            e for e in self.get_items()
+            if all(t in e["label"].lower() or t in e["subtitle"].lower() for t in terms)
+        ]
+        self.listbox.delete(0, "end")
+        for e in self.filtered[:self.MAX_ROWS]:
+            self.listbox.insert(
+                "end", f"{e['label']}   [{e['subtitle']}]" if self.show_subtitle else e["label"])
+        if self.filtered:
+            self.listbox.selection_set(0)  # so Enter in the search field picks the top match
+        self.status.set(
+            f"{len(self.filtered)} match(es){self.status_suffix()}"
+            + (f" (showing first {self.MAX_ROWS})" if len(self.filtered) > self.MAX_ROWS else ""))
+
+    def choose(self):
+        sel = self.listbox.curselection()
+        if not sel or sel[0] >= len(self.filtered):
+            return
+        entry = self.filtered[sel[0]]
+        if not entry.get("remote"):
+            self.finish(entry["path"], entry)
+            return
+
+        self.select_btn.configure(state="disabled")
+        self.status.set(f"Downloading {entry['label']}...")
+
+        def failed():
+            if self.dlg.winfo_exists():
+                self.select_btn.configure(state="normal")
+                self.refresh()
+
+        self.app.run_task(lambda: fetch_autoeq_remote_file(entry["path"]),
+                          lambda path: self.finish(path, entry),
+                          error=("AutoEQ", f"Could not download {entry['label']}"),
+                          on_error=failed)
+
+    def finish(self, path, entry=None):
+        if self.dlg.winfo_exists():  # a download may finish after Cancel
+            self.result = (path, entry)
+            self.dlg.destroy()
+
+    def run(self):
+        self.refresh()
+        _show_modal(self.app, self.dlg, self.entry)
+        self.app.wait_window(self.dlg)
+        return self.result
+
+
+class UndoHistory:
+    """Undo/redo stacks of opaque state snapshots."""
+
+    def __init__(self):
+        self._undo = []
+        self._redo = []
+
+    def record(self, state):
+        """Remember `state` (taken before a change) as one undo step."""
+        self._undo.append(state)
+        self._redo.clear()
+
+    def undo(self, current):
+        """State to restore, or None; `current` becomes redoable."""
+        if not self._undo:
+            return None
+        self._redo.append(current)
+        return self._undo.pop()
+
+    def redo(self, current):
+        if not self._redo:
+            return None
+        self._undo.append(current)
+        return self._redo.pop()
+
+
+class _LogStream:
+    """stdout/stderr while the GUI runs: text goes to the log panel through a
+    queue (so any thread may print) and on to the original stream."""
+
+    def __init__(self, q, original):
         self.q = q
+        self.original = original
 
     def write(self, text):
         if text:
             self.q.put(text)
+            if self.original is not None:
+                try:
+                    self.original.write(text)
+                except Exception:
+                    pass
+        return len(text)
 
     def flush(self):
-        pass
+        if self.original is not None:
+            try:
+                self.original.flush()
+            except Exception:
+                pass
 
 
-NEW_BAND = {"type": "PK", "freq": 1000.0, "gain": 0.0, "q": 1.0}
-GRAPH_MIN_HEIGHT = 150  # px; below this the graph is auto-hidden
+def parse_int(s, default=None):
+    """int from user text (decimal or 0x-hex), else `default`."""
+    try:
+        return int((s or "").strip(), 0)
+    except ValueError:
+        return default
+
+
+def parse_float(s, default=None):
+    """float from user text (decimal comma accepted), else `default`."""
+    try:
+        return float((s or "").strip().replace(",", "."))
+    except ValueError:
+        return default
 
 
 # ===========================================================================
-# GUI
+# GUI: AutoEQ workflow
+# ===========================================================================
+
+class AutoEqWorkflow:
+    """The GUI side of AutoEQ: pick a measurement (online database or local
+    folder), pick a target, run the optimizer — or instead fetch a profile the
+    AutoEq project already computed for that model."""
+
+    def __init__(self, app):
+        self.app = app
+        self.db_path = None        # "online" or a folder, once an index is loaded
+        self.model_index = None
+        self.target_index = None
+
+    # ---- entry points ----------------------------------------------------
+
+    def compute(self):
+        self._pick_model(self._on_measurement_chosen)
+
+    def load_precomputed(self):
+        self._pick_model(self._on_precomputed_model_chosen)
+
+    # ---- compute ---------------------------------------------------------
+
+    def _on_measurement_chosen(self, path, _entry):
+        if not path:
+            return
+        try:
+            measurement = parse_frequency_response_file(path)
+        except Exception as e:
+            messagebox.showerror("AutoEQ", f"Could not read measurement file:\n{e}")
+            return
+        self._pick_target(lambda target: self._run(measurement, target))
+
+    def _run(self, measurement, target):
+        max_filters = self.app.max_filters()
+
+        def work():
+            print("Running AutoEQ optimization, this may take a while...")
+            filters, preamp = autoeq_compute(measurement, target, max_filters)
+            print(f"AutoEQ generated {len(filters)} band(s), preamp {preamp:.1f} dB")
+            return filters, preamp
+
+        self.app.run_task(
+            work, lambda result: self.app.set_filters(*result),
+            busy=("AutoEQ", "Running AutoEQ optimization...\n"
+                            "This can take a while depending on the number of filters."),
+            error=("AutoEQ", "AutoEQ failed"))
+
+    def _pick_target(self, callback):
+        """Eventually calls callback(target_points); None means flat."""
+        choice = ask_choice(
+            self.app, "AutoEQ Target",
+            "Choose the target curve AutoEQ should reshape your measurement towards.",
+            [("Flat (0 dB)", "flat", "TButton"),
+             ("Search AutoEQ Targets...", "online", "Accent.TButton"),
+             ("Load Target File...", "file", "TButton"),
+             ("Cancel", None, "TButton")])
+        if choice == "flat":
+            callback(None)
+        elif choice == "online":
+            self._with_target_index(lambda: self._use_target_file(
+                SearchDialog(self.app, "Search AutoEQ Targets", "620x440", (560, 340),
+                             lambda: self.target_index).run()[0],
+                callback))
+        elif choice == "file":
+            self._use_target_file(filedialog.askopenfilename(
+                title="Select Target Curve File (freq, dB per line)",
+                filetypes=FILE_TYPES_CURVE), callback)
+
+    @staticmethod
+    def _use_target_file(path, callback):
+        if not path:
+            return
+        try:
+            points = parse_frequency_response_file(path)
+        except Exception as e:
+            messagebox.showerror("AutoEQ", f"Could not read target file:\n{e}")
+            return
+        callback(points)
+
+    def _with_target_index(self, on_ready):
+        """Fetch (once per session) the online target list, then on_ready()."""
+        if self.target_index is not None:
+            on_ready()
+            return
+
+        def work():
+            print("Fetching AutoEQ target curve list from GitHub...")
+            index = fetch_autoeq_targets_index()
+            print(f"Fetched {len(index)} target curve(s).")
+            return index
+
+        def done(index):
+            self.target_index = index
+            on_ready()
+
+        self.app.run_task(
+            work, done,
+            busy=("AutoEQ Targets", "Fetching target curve list from GitHub..."),
+            error=("AutoEQ Targets", "Could not fetch the target list"))
+
+    # ---- pre-computed profiles --------------------------------------------
+
+    def _on_precomputed_model_chosen(self, path, entry):
+        if not path:
+            return
+        if not entry or not entry.get("remote"):
+            messagebox.showinfo(
+                "Pre-computed Profile",
+                "Pre-computed profiles are only available for models picked "
+                "from the online AutoEQ database, not local files/folders.")
+            return
+
+        # entry["path"] is "measurements/<source>/data/<category>/<model>.csv"
+        source = entry["path"].split("/")[1]
+        model = entry["label"]
+
+        def found(candidates):
+            if not candidates:
+                messagebox.showinfo(
+                    "Pre-computed Profile",
+                    f"No pre-computed ParametricEQ.txt found for {model} under '{source}'.")
+            elif len(candidates) == 1:
+                self._load_variant(candidates[0])
+            else:
+                _, variant = SearchDialog(
+                    self.app, "Select Target Variant", "560x360", (480, 280),
+                    lambda: candidates).run()
+                if variant:
+                    self._load_variant(variant)
+
+        self.app.run_task(
+            lambda: fetch_autoeq_precomputed_profiles(source, model), found,
+            busy=("Pre-computed Profile",
+                  f"Looking up pre-computed EQ profile(s) for {model}..."),
+            error=("Pre-computed Profile", "Lookup failed"))
+
+    def _load_variant(self, candidate):
+        def apply(data):
+            self.app.set_filters(data["filters"], data["preamp"])
+            self.app.log(f"Loaded pre-computed profile ({candidate['label']})\n")
+
+        self.app.run_task(
+            lambda: load_profile(fetch_autoeq_remote_file(candidate["path"])), apply,
+            busy=("Pre-computed Profile", f"Downloading {candidate['label']}..."),
+            error=("Pre-computed Profile", "Could not load profile"))
+
+    # ---- measurement database ----------------------------------------------
+
+    def _pick_model(self, callback):
+        """Eventually calls callback(local_path, index_entry); nothing if
+        cancelled. index_entry is None for a manually browsed file."""
+        def search():
+            path, entry = self._model_search()
+            if path:
+                callback(path, entry)
+
+        if self.model_index is not None:
+            search()
+        else:
+            self._open_db(load_autoeq_db_path() or self._ask_db_source(), search)
+
+    def _ask_db_source(self):
+        """Returns "online", a local folder, or None."""
+        choice = ask_choice(
+            self.app, "AutoEQ Model Database",
+            "Search headphone/IEM measurements in the online AutoEQ database "
+            "on GitHub (jaakkopasanen/AutoEq), or in a local folder of "
+            "measurement .txt/.csv files?",
+            [("Download Online Database", "online", "Accent.TButton"),
+             ("Choose Local Folder...", "local", "TButton"),
+             ("Cancel", None, "TButton")])
+        if choice == "local":
+            return filedialog.askdirectory(title="Select Measurement Database Folder") or None
+        return choice
+
+    def _open_db(self, source, on_ready):
+        """Load and remember the model index of `source`, then on_ready()."""
+        if source is None:
+            return
+        if source != "online":
+            self.model_index, self.db_path = build_autoeq_model_index(source), source
+            save_autoeq_db_path(source)
+            on_ready()
+            return
+
+        def work():
+            print("Fetching AutoEQ database listing from GitHub...")
+            index = fetch_autoeq_online_index()
+            print(f"Fetched {len(index)} model(s) from the online database.")
+            return index
+
+        def done(index):
+            self.model_index, self.db_path = index, "online"
+            save_autoeq_db_path("online")
+            on_ready()
+
+        self.app.run_task(
+            work, done,
+            busy=("AutoEQ Model Database", "Fetching model list from GitHub..."),
+            error=("AutoEQ Model Database", "Could not fetch the online database"))
+
+    def _model_search(self):
+        dialog = SearchDialog(
+            self.app, "Search Headphone Model", "700x480", (650, 360),
+            lambda: self.model_index, show_subtitle=True,
+            status_suffix=lambda: f" in {os.path.basename(self.db_path)}")
+
+        def browse_file():
+            path = filedialog.askopenfilename(
+                title="Select Measurement File (freq, dB per line)",
+                filetypes=FILE_TYPES_CURVE)
+            if path:
+                dialog.finish(path, None)
+
+        def change_db():
+            source = self._ask_db_source()
+            if source == "online":
+                dialog.status.set("Fetching online database...")
+            self._open_db(source, dialog.refresh)
+
+        dialog.add_button("Browse File Instead...", browse_file)
+        dialog.add_button("Change Database...", change_db)
+        return dialog.run()
+
+
+# ===========================================================================
+# GUI: main window
 # ===========================================================================
 
 class EqLoaderGUI(tk.Tk):
+    """Main window: device picker, EQ editor (graph + band list + fields),
+    push/pull/file actions and the log."""
 
     def __init__(self, graph=None):
         super().__init__()
+        self.title("Walkplay PEQ Loader")
+        self.geometry("950x850")
+        self.minsize(850, 700)
+        self.font_ui, self.font_mono = _install_theme(self)
 
-        # None = auto (hide when short), True = always show, False = always hide
+        # Worker threads never touch Tk: they queue log text and completion
+        # callbacks, which _poll_queues() runs on the Tk thread.
+        self.log_queue = queue.Queue()
+        self._ui_calls = queue.Queue()
+        self._poll_after_id = None
+        # Route print() from any thread into the log panel for the app's lifetime.
+        self._saved_streams = (sys.stdout, sys.stderr)
+        sys.stdout = _LogStream(self.log_queue, sys.stdout)
+        sys.stderr = _LogStream(self.log_queue, sys.stderr)
+
+        # Graph visibility: None = auto (hide when short), True/False = forced.
         self._graph_forced = graph
         self._graph_show_threshold = None  # window height at/above which the graph fits
         self._layout_ready = False
         self._resize_after_id = None
 
-        self.title("Walkplay PEQ Loader")
-        self.geometry("950x850")
-        self.minsize(850, 700)
-
-        self._apply_theme()
-
-        self.log_queue = queue.Queue()
+        self.devices = []          # hid.enumerate() entries, in device-list order
         self.selected_path = None
-        self._devices_cache = []
 
-        self.create_filters = [dict(NEW_BAND)]
-        self.selected_filter = 0
+        # Editor state: the EQ being built and the primary selected band.
+        self.filters = [dict(NEW_BAND)]
+        self.selected = 0
+        self.history = UndoHistory()
+        self._drag_idx = None           # band being dragged on the graph
+        self._drag_recorded = False     # undo step taken for this drag
+        self._loading_editor = False    # suppress field traces while filling fields
+        self._editor_recorded = False   # one undo step per field-edit session
 
-        self._undo_stack = []
-        self._redo_stack = []
-        self._dragging_point_idx = None
-        self._drag_snapshot_taken = False
-
-        # Live editor state.
-        self._loading_editor = False       # suppress traces while loading fields
-        self._editor_snapshot_taken = False  # one undo step per edit session
-
-        # AutoEQ model database (lazily built the first time it's browsed).
-        self._autoeq_db_path = None
-        self._autoeq_model_index = None
-        self._autoeq_model_index_path = None
-        self._autoeq_target_index = None  # lazily fetched target-curve list
+        self.autoeq = AutoEqWorkflow(self)
 
         self._build_widgets()
-
         if self._graph_forced is False:
             self._set_graph_visible(False)
 
-        # Evaluate initial graph visibility once the window is actually mapped
-        # (its real size is only known then); a timed call is a fallback in
-        # case <Map> was already delivered.
+        # Evaluate graph visibility once the window is mapped (its real size
+        # is only known then); the timed call covers an already-delivered <Map>.
         self.bind("<Map>", self._on_mapped, add="+")
         self.after(200, self._mark_layout_ready)
-        self._theme_classic_widgets()
-        self._poll_log_queue()
-
+        self._poll_queues()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if hid is None:
-            self._log("ERROR: the 'hidapi' package is not installed.\n"
-                      "Run:  pip install hidapi\n"
-                      "Then restart this app.\n")
+            self.log("ERROR: the 'hidapi' package is not installed.\n"
+                     "Run:  pip install hidapi\n"
+                     "Then restart this app.\n")
 
-    # ------------------------------------------------------------------
-    # Theme
-    # ------------------------------------------------------------------
-
-    def _apply_theme(self):
-        """Skin every ttk widget as a graphite instrument panel."""
-        c = THEME
-        self.font_ui = _pick_font(self, UI_FONTS)
-        self.font_mono = _pick_font(self, MONO_FONTS)
-
-        self.configure(bg=c["chassis"])
-
-        style = ttk.Style(self)
-        # 'clam' is the one built-in theme that honours colour overrides.
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-
-        base_font = (self.font_ui, 10)
-
-        style.configure(".", background=c["chassis"], foreground=c["ink"],
-                        fieldbackground=c["input"], bordercolor=c["line"],
-                        lightcolor=c["line"], darkcolor=c["line"],
-                        troughcolor=c["panel"], font=base_font)
-
-        style.configure("TFrame", background=c["chassis"])
-        style.configure("TLabel", background=c["chassis"],
-                        foreground=c["ink"], font=base_font)
-        style.configure("Muted.TLabel", background=c["chassis"],
-                        foreground=c["muted"], font=(self.font_ui, 9))
-
-        style.configure("TLabelframe", background=c["chassis"],
-                        bordercolor=c["line"], relief="solid", borderwidth=1)
-        style.configure("TLabelframe.Label", background=c["chassis"],
-                        foreground=c["muted"], font=(self.font_ui, 9, "bold"))
-
-        for widget in ("TEntry", "TSpinbox", "TCombobox"):
-            style.configure(widget, background=c["input"],
-                            fieldbackground=c["input"], foreground=c["ink"],
-                            insertcolor=c["accent"], bordercolor=c["line"],
-                            arrowcolor=c["muted"], padding=4)
-            style.map(widget, bordercolor=[("focus", c["accent"])],
-                      foreground=[("disabled", c["muted"])])
-
-        # readonly combobox field needs explicit state mappings.
-        style.map("TCombobox",
-                  fieldbackground=[("readonly", c["input"]), ("disabled", c["panel"])],
-                  foreground=[("readonly", c["ink"]), ("disabled", c["muted"])],
-                  selectbackground=[("readonly", c["input"])],
-                  selectforeground=[("readonly", c["ink"])],
-                  background=[("focus", c["input"]), ("active", c["line"]),
-                              ("!focus", c["input"])],
-                  arrowcolor=[("focus", c["accent"]), ("active", c["accent"]),
-                              ("!focus", c["muted"])])
-
-        style.configure("TButton", background=c["input"], foreground=c["ink"],
-                        bordercolor=c["line"], focuscolor=c["accent"],
-                        relief="flat", padding=(10, 6), font=base_font)
-        style.map("TButton",
-                  background=[("pressed", c["accent_dk"]), ("active", c["line"])],
-                  foreground=[("pressed", c["chassis"])],
-                  bordercolor=[("active", c["accent"])])
-
-        style.configure("Accent.TButton", background=c["accent"],
-                        foreground=c["chassis"], relief="flat",
-                        padding=(10, 6), font=(self.font_ui, 10, "bold"))
-        style.map("Accent.TButton",
-                  background=[("pressed", c["accent_dk"]), ("active", c["accent_dk"])],
-                  foreground=[("active", c["chassis"])])
-
-        style.configure("Danger.TButton", background=c["input"],
-                        foreground=c["danger"], relief="flat", padding=(10, 6))
-        style.map("Danger.TButton",
-                  background=[("active", c["danger"]), ("pressed", c["danger"])],
-                  foreground=[("active", c["chassis"]), ("pressed", c["chassis"])])
-
-        style.configure("TCheckbutton", background=c["chassis"],
-                        foreground=c["ink"], focuscolor=c["accent"])
-        style.map("TCheckbutton", background=[("active", c["chassis"])],
-                  indicatorcolor=[("selected", c["accent"]), ("!selected", c["input"])])
-
-        style.configure("TNotebook", background=c["chassis"],
-                        bordercolor=c["line"], tabmargins=(2, 4, 2, 0))
-        style.configure("TNotebook.Tab", background=c["panel"], foreground=c["muted"],
-                        bordercolor=c["line"], padding=(14, 7), font=base_font)
-        style.map("TNotebook.Tab", background=[("selected", c["chassis"])],
-                  foreground=[("selected", c["accent"]), ("active", c["ink"])])
-
-        for sb in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
-            style.configure(sb, background=c["input"], troughcolor=c["panel"],
-                            bordercolor=c["panel"], arrowcolor=c["muted"])
-            style.map(sb, background=[("active", c["line"])])
-
-        # Combobox dropdown popup is a plain tk.Listbox — style via option_add.
-        self.option_add("*TCombobox*Listbox.background", c["input"])
-        self.option_add("*TCombobox*Listbox.foreground", c["ink"])
-        self.option_add("*TCombobox*Listbox.selectBackground", c["accent"])
-        self.option_add("*TCombobox*Listbox.selectForeground", c["chassis"])
-        self.option_add("*TCombobox*Listbox.font", (self.font_ui, 10))
-
-    def _theme_classic_widgets(self):
-        """Colour the non-ttk (classic tk) widgets to match the theme."""
-        c = THEME
-        list_opts = dict(
-            bg=c["panel"], fg=c["ink"], selectbackground=c["accent"],
-            selectforeground=c["chassis"], highlightthickness=1,
-            highlightbackground=c["line"], highlightcolor=c["accent"],
-            borderwidth=0, activestyle="none", font=(self.font_ui, 10),
-        )
-        for lb in (self.device_list, self.filter_list):
-            lb.configure(**list_opts)
-
-        self.log_text.configure(
-            bg=c["chassis"], fg=c["accent"], insertbackground=c["accent"],
-            selectbackground=c["input"], selectforeground=c["ink"],
-            highlightthickness=1, highlightbackground=c["line"],
-            borderwidth=0, font=(self.font_mono, 9), padx=8, pady=6,
-        )
-        self.log_text.vbar.configure(
-            bg=c["input"], troughcolor=c["panel"], activebackground=c["line"],
-            highlightbackground=c["panel"], highlightcolor=c["panel"],
-            borderwidth=0, relief="flat",
-        )
+    def destroy(self):
+        if self._poll_after_id is not None:
+            self.after_cancel(self._poll_after_id)
+        sys.stdout, sys.stderr = self._saved_streams
+        super().destroy()
 
     # ------------------------------------------------------------------
     # Layout
@@ -1386,53 +1900,72 @@ class EqLoaderGUI(tk.Tk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=0)
 
-        # ---- Device (row 0) ----
+        self._build_device_rows()
+        self._build_graph()
+        self._build_editor()
+        self._build_eq_settings()
+        self._build_log()
+        self._build_actions()
+
+        self.bind("<Configure>", self._on_window_resize)
+        for seq, handler in (
+            ("<Control-z>", self._undo),
+            ("<Control-y>", self._redo),
+            ("<Control-Shift-z>", self._redo),
+            ("<Control-Shift-Z>", self._redo),
+            ("<F5>", self._refresh_devices),
+            ("<Control-g>", self._get_slot),
+            ("<Control-Shift-E>", self._enable),
+            ("<Control-Shift-X>", self._disable),
+        ):
+            self.bind(seq, lambda _e, h=handler: h())
+
+        self._refresh_editor()
+        self._refresh_devices()
+
+    def _tooltip(self, widget, text):
+        _add_tooltip(widget, text, self.font_ui)
+
+    def _build_device_rows(self):
         dev_frame = ttk.LabelFrame(self, text="Device")
         dev_frame.grid(row=0, column=0, columnspan=2, sticky="ew", padx=8, pady=6)
 
-        self.device_list = tk.Listbox(dev_frame, height=4)
+        self.device_list = _listbox(dev_frame, self.font_ui, height=4)
         self.device_list.pack(fill="x", padx=6, pady=6, side="left", expand=True)
         self.device_list.bind("<<ListboxSelect>>", self._on_device_select)
 
         btn_frame = ttk.Frame(dev_frame)
         btn_frame.pack(side="left", padx=6)
-        refresh_btn = ttk.Button(btn_frame, text="Refresh List",
-                                 command=self._refresh_devices)
-        refresh_btn.pack(fill="x", pady=2)
-        self._add_tooltip(refresh_btn, "F5")
-        slot_btn = ttk.Button(btn_frame, text="Get Slot / Version",
-                              command=self._get_slot)
-        slot_btn.pack(fill="x", pady=2)
-        self._add_tooltip(slot_btn, "Ctrl+G")
+        for text, command, accel in (("Refresh List", self._refresh_devices, "F5"),
+                                     ("Get Slot / Version", self._get_slot, "Ctrl+G")):
+            btn = ttk.Button(btn_frame, text=text, command=command)
+            btn.pack(fill="x", pady=2)
+            self._tooltip(btn, accel)
 
-        # ---- VID / PID (row 1) ----
-        override_frame = ttk.Frame(self)
-        override_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=2)
+        override = ttk.Frame(self)
+        override.grid(row=1, column=0, columnspan=2, sticky="ew", padx=8, pady=2)
 
-        ttk.Label(override_frame, text="VID (hex):").grid(row=0, column=0, sticky="w")
-        self.vid_entry = ttk.Entry(override_frame, width=10)
-        self.vid_entry.insert(0, "0x3302")
+        ttk.Label(override, text="VID (hex):").grid(row=0, column=0, sticky="w")
+        self.vid_entry = ttk.Entry(override, width=10)
+        self.vid_entry.insert(0, f"0x{WALKPLAY_VENDOR_ID:04X}")
         self.vid_entry.grid(row=0, column=1, padx=4)
 
-        ttk.Label(override_frame, text="PID (hex, optional):").grid(
-            row=0, column=2, sticky="w")
-        self.pid_entry = ttk.Entry(override_frame, width=10)
+        ttk.Label(override, text="PID (hex, optional):").grid(row=0, column=2, sticky="w")
+        self.pid_entry = ttk.Entry(override, width=10)
         self.pid_entry.grid(row=0, column=3, padx=4)
 
-        ttk.Label(override_frame, text="Max filters:").grid(
-            row=0, column=4, sticky="w", padx=(12, 0))
+        ttk.Label(override, text="Max filters:").grid(row=0, column=4, sticky="w", padx=(12, 0))
         int_only = (self.register(lambda s: s == "" or s.isdigit()), "%P")
-        self.max_filter_entry = ttk.Spinbox(
-            override_frame, from_=1, to=64, increment=1, width=6,
+        self.max_filter_spin = ttk.Spinbox(
+            override, from_=1, to=64, increment=1, width=6,
             validate="key", validatecommand=int_only)
-        self.max_filter_entry.set(DEFAULT_MAX_FILTERS)
-        self.max_filter_entry.grid(row=0, column=5, padx=4)
+        self.max_filter_spin.set(DEFAULT_MAX_FILTERS)
+        self.max_filter_spin.grid(row=0, column=5, padx=4)
 
-        # ---- Graph (row 2, col 0) ----
+    def _build_graph(self):
         self.fig = Figure(figsize=(7, 4), dpi=100,
                           facecolor=THEME["chassis"], layout="constrained")
         self.ax = self.fig.add_subplot(111)
-        self.ax.set_facecolor(THEME["panel"])
 
         # grid_propagate(False) stops the canvas's own size requests from
         # forcing a main-window geometry recalculation on matplotlib redraws.
@@ -1448,42 +1981,40 @@ class EqLoaderGUI(tk.Tk):
 
         self._graph_too_small_label = tk.Label(
             self.graph_frame, text="Window too small to display graph",
-            bg=THEME["chassis"], fg=THEME["muted"], font=("TkDefaultFont", 9),
-        )
+            bg=THEME["chassis"], fg=THEME["muted"], font=("TkDefaultFont", 9))
 
-        # ---- Filter list + editor (row 3, col 0) ----
+    def _build_editor(self):
         ctrl = ttk.Frame(self)
         ctrl.grid(row=3, column=0, sticky="ew", padx=(8, 4), pady=2)
         ctrl.columnconfigure(1, weight=1)
 
         list_frame = ttk.LabelFrame(ctrl, text="Filters")
         list_frame.grid(row=0, column=0, sticky="ns")
-        self.filter_list = tk.Listbox(list_frame, height=7, selectmode="extended")
+        self.filter_list = _listbox(list_frame, self.font_ui, height=7, selectmode="extended")
         self.filter_list.pack(fill="both", expand=True, padx=5, pady=5)
-        self.filter_list.bind("<<ListboxSelect>>", self._create_select_band)
+        self.filter_list.bind("<<ListboxSelect>>", self._on_list_select)
 
         edit = ttk.LabelFrame(ctrl, text="Selected Filter")
         edit.grid(row=0, column=1, sticky="nsew", padx=10)
         edit.columnconfigure(1, weight=1)
 
-        for row_i, (lbl, var_name, default, lo, hi, step, fmt) in enumerate((
-            ("Frequency (Hz)", "freq_var", "1000", 10, 30000, 1, "%.0f"),
-            ("Gain (dB)", "gain_var", "0", -30, 30, 0.1, "%.1f"),
-            ("Q", "q_var", "1.0", 0.1, 100, 0.1, "%.1f"),
+        self.field_vars = {}
+        for row, (field, label, default, lo, hi, step, fmt) in enumerate((
+            ("freq", "Frequency (Hz)", "1000", 10, 30000, 1, "%.0f"),
+            ("gain", "Gain (dB)", "0", -30, 30, 0.1, "%.1f"),
+            ("q", "Q", "1.0", 0.1, 100, 0.1, "%.1f"),
         )):
-            lbl_widget = ttk.Label(edit, text=lbl)
-            lbl_widget.grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
-            if var_name == "q_var":
-                self.q_label = lbl_widget
-            setattr(self, var_name, tk.StringVar(value=default))
-            ttk.Spinbox(edit, textvariable=getattr(self, var_name),
-                        from_=lo, to=hi, increment=step, format=fmt).grid(
-                row=row_i, column=1, sticky="ew", padx=5, pady=3)
+            label_widget = ttk.Label(edit, text=label)
+            label_widget.grid(row=row, column=0, sticky="w", padx=5, pady=3)
+            var = self.field_vars[field] = tk.StringVar(value=default)
+            ttk.Spinbox(edit, textvariable=var, from_=lo, to=hi, increment=step,
+                        format=fmt).grid(row=row, column=1, sticky="ew", padx=5, pady=3)
+        self.q_label = label_widget
 
         ttk.Label(edit, text="Type").grid(row=3, column=0, sticky="w", padx=5, pady=3)
-        self.type_var = tk.StringVar(value="PK")
-        ttk.Combobox(edit, textvariable=self.type_var,
-                     values=["PK", "LSQ", "HSQ", "LP", "HP"], state="readonly").grid(
+        self.field_vars["type"] = tk.StringVar(value="PK")
+        ttk.Combobox(edit, textvariable=self.field_vars["type"],
+                     values=list(FILTER_TYPES), state="readonly").grid(
             row=3, column=1, sticky="ew", padx=5, pady=3)
 
         self.bw_mode = tk.BooleanVar(value=False)
@@ -1491,29 +2022,31 @@ class EqLoaderGUI(tk.Tk):
                         command=self._toggle_bw_mode).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=5, pady=2)
 
-        # ---- Operations bar (row 4, col 0) ----
+        # Live-apply editor fields to the current selection as they change.
+        for field, var in self.field_vars.items():
+            var.trace_add("write", lambda *_, f=field: self._apply_field(f))
+
+    def _build_eq_settings(self):
         ops = ttk.Frame(self)
         ops.grid(row=4, column=0, sticky="ew", padx=(8, 4), pady=2)
         ops.columnconfigure(0, weight=1)
         ops.columnconfigure(1, weight=1)
 
-        push_created_frame = ttk.LabelFrame(ops, text="EQ")
-        push_created_frame.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=2)
-        for lbl, attr, default in (
-            ("Slot", "create_slot_spin", "0"),
-            ("Preamp (dB)", "create_preamp_entry", "0"),
-            ("Buffer (dB)", "create_buffer_entry",
-             str(float(DEFAULT_GLOBAL_GAIN_BUFFER))),
-        ):
-            ttk.Label(push_created_frame, text=f"{lbl}:").pack(side="left", padx=(8, 2))
-            if lbl == "Slot":
-                w = ttk.Spinbox(push_created_frame, from_=0, to=15, width=5)
-            else:
-                w = ttk.Spinbox(push_created_frame, from_=-30, to=30,
-                                increment=0.1, format="%.1f", width=7)
-            w.set(default)
-            w.pack(side="left", padx=(0, 6))
-            setattr(self, attr, w)
+        eq_frame = ttk.LabelFrame(ops, text="EQ")
+        eq_frame.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=2)
+        ttk.Label(eq_frame, text="Slot:").pack(side="left", padx=(8, 2))
+        self.slot_spin = ttk.Spinbox(eq_frame, from_=0, to=15, width=5)
+        self.slot_spin.set("0")
+        self.slot_spin.pack(side="left", padx=(0, 6))
+        for label, attr, default in (("Preamp (dB)", "preamp_spin", "0"),
+                                     ("Buffer (dB)", "buffer_spin",
+                                      str(float(DEFAULT_GLOBAL_GAIN_BUFFER)))):
+            ttk.Label(eq_frame, text=f"{label}:").pack(side="left", padx=(8, 2))
+            spin = ttk.Spinbox(eq_frame, from_=-30, to=30, increment=0.1,
+                               format="%.1f", width=7)
+            spin.set(default)
+            spin.pack(side="left", padx=(0, 6))
+            setattr(self, attr, spin)
 
         ed_frame = ttk.LabelFrame(ops, text="PEQ Enable / Disable")
         ed_frame.grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=2)
@@ -1521,67 +2054,57 @@ class EqLoaderGUI(tk.Tk):
         self.ed_slot_spin = ttk.Spinbox(ed_frame, from_=0, to=15, width=5)
         self.ed_slot_spin.set(0)
         self.ed_slot_spin.pack(side="left", padx=(0, 8))
-        enable_btn = ttk.Button(ed_frame, text="Enable PEQ", command=self._enable,
-                                style="Accent.TButton")
-        enable_btn.pack(side="left", padx=4, pady=4)
-        self._add_tooltip(enable_btn, "Ctrl+Shift+E")
-        disable_btn = ttk.Button(ed_frame, text="Disable PEQ", command=self._disable,
-                                 style="Danger.TButton")
-        disable_btn.pack(side="left", padx=4, pady=4)
-        self._add_tooltip(disable_btn, "Ctrl+Shift+X")
+        for text, command, style, accel in (
+            ("Enable PEQ", self._enable, "Accent.TButton", "Ctrl+Shift+E"),
+            ("Disable PEQ", self._disable, "Danger.TButton", "Ctrl+Shift+X"),
+        ):
+            btn = ttk.Button(ed_frame, text=text, command=command, style=style)
+            btn.pack(side="left", padx=4, pady=4)
+            self._tooltip(btn, accel)
 
-        # ---- Log (row 5, col 0) ----
+    def _build_log(self):
+        c = THEME
         log_frame = ttk.LabelFrame(self, text="Log")
         log_frame.grid(row=5, column=0, sticky="nsew", padx=(8, 4), pady=6)
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=5, state="disabled")
+        self.log_text = scrolledtext.ScrolledText(
+            log_frame, height=5, state="disabled",
+            bg=c["chassis"], fg=c["accent"], insertbackground=c["accent"],
+            selectbackground=c["input"], selectforeground=c["ink"],
+            highlightthickness=1, highlightbackground=c["line"],
+            borderwidth=0, font=(self.font_mono, 9), padx=8, pady=6)
+        self.log_text.vbar.configure(
+            bg=c["input"], troughcolor=c["panel"], activebackground=c["line"],
+            highlightbackground=c["panel"], highlightcolor=c["panel"],
+            borderwidth=0, relief="flat")
         self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
 
-        # ---- Actions panel (col 1, rows 2–5) ----
+    def _build_actions(self):
         actions = ttk.LabelFrame(self, text="Actions")
         actions.grid(row=2, column=1, rowspan=4, sticky="nsew", padx=(0, 8), pady=6)
         actions.columnconfigure(0, weight=1)
 
-        action_btns = (
-            ("Add Band", self._create_add_band, "TButton", "Ctrl+B", "<Control-b>"),
-            ("Delete Band", self._create_delete_band, "Danger.TButton", "Ctrl+D", "<Control-d>"),
-            ("Delete All", self._create_delete_all_bands, "Danger.TButton",
+        for i, (text, command, style, accel, seq) in enumerate((
+            ("Add Band", self._add_band, "TButton", "Ctrl+B", "<Control-b>"),
+            ("Delete Band", self._delete_selected_bands, "Danger.TButton",
+             "Ctrl+D", "<Control-d>"),
+            ("Delete All", self._delete_all_bands, "Danger.TButton",
              "Ctrl+Shift+D", "<Control-Shift-D>"),
-            ("Load EQ from Device", self._create_load_from_device, "TButton",
+            ("Load EQ from Device", self._load_from_device, "TButton",
              "Ctrl+E", "<Control-e>"),
-            ("Save Profile to File", self._create_save_profile, "TButton", "Ctrl+S", "<Control-s>"),
-            ("Load Profile from File", self._create_load_profile, "TButton",
+            ("Save Profile to File", self._save_profile, "TButton", "Ctrl+S", "<Control-s>"),
+            ("Load Profile from File", self._load_profile, "TButton",
              "Ctrl+O", "<Control-o>"),
-            ("Compute AutoEQ", self._create_autoeq, "TButton",
+            ("Compute AutoEQ", self.autoeq.compute, "TButton",
              "Ctrl+Shift+A", "<Control-Shift-A>"),
-            ("Load Pre-computed AutoEQ", self._create_load_autoeq_profile, "TButton",
+            ("Load Pre-computed AutoEQ", self.autoeq.load_precomputed, "TButton",
              "Ctrl+Shift+L", "<Control-Shift-L>"),
-            ("Push EQ to Device", self._create_push, "Accent.TButton", "Ctrl+P", "<Control-p>"),
-        )
-        for i, (text, cmd, style, accel, seq) in enumerate(action_btns):
+            ("Push EQ to Device", self._push, "Accent.TButton", "Ctrl+P", "<Control-p>"),
+        )):
             actions.rowconfigure(i, weight=1)
-            btn = ttk.Button(actions, text=text, command=cmd, style=style)
+            btn = ttk.Button(actions, text=text, command=command, style=style)
             btn.grid(row=i, column=0, sticky="nsew", padx=6, pady=2)
-            self.bind(seq, lambda _e, c=cmd: c())
-            self._add_tooltip(btn, accel)
-
-        # ---- Bindings + initial state ----
-        self.bind("<Configure>", self._on_window_resize)
-        self.bind("<Control-z>", self._undo)
-        self.bind("<Control-y>", self._redo)
-        self.bind("<Control-Shift-z>", self._redo)
-        self.bind("<F5>", lambda _e: self._refresh_devices())
-        self.bind("<Control-g>", lambda _e: self._get_slot())
-        self.bind("<Control-Shift-E>", lambda _e: self._enable())
-        self.bind("<Control-Shift-X>", lambda _e: self._disable())
-
-        # Live-apply editor fields to the current selection as they change.
-        self.freq_var.trace_add("write", lambda *_: self._apply_field_to_selection("freq"))
-        self.gain_var.trace_add("write", lambda *_: self._apply_field_to_selection("gain"))
-        self.q_var.trace_add("write", lambda *_: self._apply_field_to_selection("q"))
-        self.type_var.trace_add("write", lambda *_: self._apply_field_to_selection("type"))
-
-        self._refresh_create_tab()
-        self._refresh_devices()
+            self.bind(seq, lambda _e, c=command: c())
+            self._tooltip(btn, accel)
 
     # ------------------------------------------------------------------
     # Graph auto-hide on resize
@@ -1633,1578 +2156,506 @@ class EqLoaderGUI(tk.Tk):
             self._set_graph_visible(True)
 
     # ------------------------------------------------------------------
-    # Create / editor
+    # Editor: band list, fields, graph
     # ------------------------------------------------------------------
 
-    def _refresh_create_tab(self):
+    def max_filters(self):
+        return parse_int(self.max_filter_spin.get(), DEFAULT_MAX_FILTERS)
+
+    def _set_preamp(self, value):
+        self.preamp_spin.delete(0, "end")
+        self.preamp_spin.insert(0, value if isinstance(value, str) else f"{value:g}")
+
+    def _selection(self):
+        """Indices the editor fields apply to: the list selection, else the primary band."""
+        return self.filter_list.curselection() or (
+            (self.selected,) if 0 <= self.selected < len(self.filters) else ())
+
+    def _refresh_editor(self):
+        """Redraw the band list (selecting the primary band) and the graph."""
         self._render_filter_rows()
-
-        if self.create_filters:
-            if self.selected_filter >= len(self.create_filters):
-                self.selected_filter = len(self.create_filters) - 1
+        if self.filters:
+            self.selected = min(self.selected, len(self.filters) - 1)
             self.filter_list.selection_clear(0, "end")
-            self.filter_list.selection_set(self.selected_filter)
-            self.filter_list.see(self.selected_filter)
-        else:
-            self.selected_filter = -1
-
-        self._draw_response_graph()
+            self.filter_list.selection_set(self.selected)
+            self.filter_list.see(self.selected)
+        self._draw_graph()
 
     def _render_filter_rows(self):
-        """Rebuild the listbox rows from create_filters (selection untouched)."""
+        """Rebuild the listbox rows from self.filters (selection untouched)."""
         self.filter_list.delete(0, "end")
-        for i, f in enumerate(self.create_filters):
+        for i, f in enumerate(self.filters):
             self.filter_list.insert(
-                "end",
-                f"{i + 1}: {f['freq']:.1f} Hz  {f['gain']:.1f} dB  "
-                f"Q {f['q']:.2f}  {f['type']}")
+                "end", f"{i + 1}: {f['freq']:.1f} Hz  {f['gain']:.1f} dB  "
+                       f"Q {f['q']:.2f}  {f['type']}")
 
-    @staticmethod
-    def _biquad_response_db(freqs, freq0, gain_db, q, ftype, fs=DEVICE_SAMPLE_RATE):
-        q = max(q, 0.001)
-        w0 = 2 * np.pi * freq0 / fs
-        A = 10 ** (gain_db / 40)
-        alpha = np.sin(w0) / (2 * q)
-        cw = np.cos(w0)
-
-        if ftype == "PK":
-            b0 = 1 + alpha * A
-            b1 = -2 * cw
-            b2 = 1 - alpha * A
-            a0 = 1 + alpha / A
-            a1 = -2 * cw
-            a2 = 1 - alpha / A
-        elif ftype == "LSQ":
-            sqA = np.sqrt(A)
-            b0 = A * ((A + 1) - (A - 1) * cw + 2 * sqA * alpha)
-            b1 = 2 * A * ((A - 1) - (A + 1) * cw)
-            b2 = A * ((A + 1) - (A - 1) * cw - 2 * sqA * alpha)
-            a0 = (A + 1) + (A - 1) * cw + 2 * sqA * alpha
-            a1 = -2 * ((A - 1) + (A + 1) * cw)
-            a2 = (A + 1) + (A - 1) * cw - 2 * sqA * alpha
-        elif ftype == "HSQ":
-            sqA = np.sqrt(A)
-            b0 = A * ((A + 1) + (A - 1) * cw + 2 * sqA * alpha)
-            b1 = -2 * A * ((A - 1) + (A + 1) * cw)
-            b2 = A * ((A + 1) + (A - 1) * cw - 2 * sqA * alpha)
-            a0 = (A + 1) - (A - 1) * cw + 2 * sqA * alpha
-            a1 = 2 * ((A - 1) - (A + 1) * cw)
-            a2 = (A + 1) - (A - 1) * cw - 2 * sqA * alpha
-        elif ftype == "HP":
-            b0 = (1 + cw) / 2
-            b1 = -(1 + cw)
-            b2 = (1 + cw) / 2
-            a0 = 1 + alpha
-            a1 = -2 * cw
-            a2 = 1 - alpha
-        elif ftype == "LP":
-            b0 = (1 - cw) / 2
-            b1 = 1 - cw
-            b2 = (1 - cw) / 2
-            a0 = 1 + alpha
-            a1 = -2 * cw
-            a2 = 1 - alpha
-        else:
-            return np.zeros_like(freqs)
-
-        b0 /= a0; b1 /= a0; b2 /= a0
-        a1 /= a0; a2 /= a0
-
-        w = 2 * np.pi * freqs / fs
-        ejw_n1 = np.exp(-1j * w)
-        ejw_n2 = np.exp(-2j * w)
-        H = (b0 + b1 * ejw_n1 + b2 * ejw_n2) / (1 + a1 * ejw_n1 + a2 * ejw_n2)
-        return 20 * np.log10(np.abs(H) + 1e-12)
-
-    def _draw_response_graph(self):
+    def _draw_graph(self):
         c = THEME
-        self.ax.clear()
+        ax = self.ax
+        ax.clear()
+        ax.set_facecolor(c["panel"])
 
         freqs = np.logspace(np.log10(20), np.log10(20000), 1000)
-        response = np.zeros(len(freqs))
+        response = filters_response_db(freqs, self.filters)
 
-        selected = set(self.filter_list.curselection())
-        selected.add(self.selected_filter)
-
-        for index, f in enumerate(self.create_filters):
-            try:
-                center_freq = float(f["freq"])
-                gain = float(f["gain"])
-                q = max(float(f["q"]), 0.01)
-            except (ValueError, TypeError):
-                continue
-            if center_freq <= 0:
-                continue
-
-            response += self._biquad_response_db(
-                freqs, center_freq, gain, q, f.get("type", "PK"))
-
-            is_selected = index in selected
-            color = c["active"] if is_selected else c["accent"]
-
-            # Amber glow halo around the active band's handle.
-            if is_selected:
-                self.ax.plot([center_freq], [gain], marker="o", markersize=16,
-                             color=c["active"], alpha=0.25, zorder=4)
-
-            self.ax.plot([center_freq], [gain], marker="o", markersize=9,
-                         markerfacecolor=color, markeredgecolor=c["chassis"],
-                         markeredgewidth=1.5, zorder=5)
-
-        self.fig.set_facecolor(c["chassis"])
-        self.ax.set_facecolor(c["panel"])
+        highlighted = set(self.filter_list.curselection()) | {self.selected}
+        for index, f in enumerate(self.filters):
+            color = c["active"] if index in highlighted else c["accent"]
+            if index in highlighted:  # amber glow halo
+                ax.plot([f["freq"]], [f["gain"]], marker="o", markersize=16,
+                        color=c["active"], alpha=0.25, zorder=4)
+            ax.plot([f["freq"]], [f["gain"]], marker="o", markersize=9,
+                    markerfacecolor=color, markeredgecolor=c["chassis"],
+                    markeredgewidth=1.5, zorder=5)
 
         # Filled scope trace with a soft glow underneath.
-        self.ax.fill_between(freqs, response, 0, color=c["accent"], alpha=0.10, zorder=1)
-        for lw, a in ((5, 0.10), (3, 0.18)):  # glow layers
-            self.ax.plot(freqs, response, linewidth=lw, color=c["accent"], alpha=a, zorder=2)
-        self.ax.plot(freqs, response, linewidth=2.0, color=c["accent"], zorder=3)
+        ax.fill_between(freqs, response, 0, color=c["accent"], alpha=0.10, zorder=1)
+        for lw, alpha in ((5, 0.10), (3, 0.18)):
+            ax.plot(freqs, response, linewidth=lw, color=c["accent"], alpha=alpha, zorder=2)
+        ax.plot(freqs, response, linewidth=2.0, color=c["accent"], zorder=3)
+        ax.axhline(0, color=c["muted"], linewidth=0.8, alpha=0.6, zorder=1)
 
-        # 0 dB reference line.
-        self.ax.axhline(0, color=c["muted"], linewidth=0.8, alpha=0.6, zorder=1)
+        ax.set_xscale("log")
+        ax.set_xlim(20, 20000)
+        ax.set_ylim(-GRAPH_GAIN_LIMIT, GRAPH_GAIN_LIMIT)
+        ticks = [20, 100, 1000, 10000, 20000]
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f"{t // 1000} kHz" if t >= 1000 else f"{t} Hz" for t in ticks])
 
-        self.ax.set_xscale("log")
-        self.ax.set_xlim(20, 20000)
-        self.ax.set_ylim(-15, 15)
-
-        def freq_formatter(x, pos):
-            if x >= 1000:
-                return f"{x/1000:.0f} kHz"
-            else:
-                return f"{x:.0f} Hz"
-
-        self.ax.xaxis.set_major_locator(ticker.LogLocator(base=10, numticks=10))
-        self.ax.xaxis.set_major_formatter(ticker.FuncFormatter(freq_formatter))
-
-        # Set custom ticks to show only 20 Hz and 20 kHz (exclude 0)
-        major_ticks = [20, 100, 1000, 10000, 20000]
-        self.ax.set_xticks(major_ticks)
-        self.ax.set_xticklabels([freq_formatter(t, None) for t in major_ticks])
-
-        self.ax.grid(True, which="major", color=c["line"], linewidth=0.8, alpha=0.9)
-        self.ax.grid(True, which="minor", color=c["line"], linewidth=0.5, alpha=0.4)
-
-        for side, spine in self.ax.spines.items():
+        ax.grid(True, which="major", color=c["line"], linewidth=0.8, alpha=0.9)
+        ax.grid(True, which="minor", color=c["line"], linewidth=0.5, alpha=0.4)
+        for side, spine in ax.spines.items():
             spine.set_color(c["line"])
             spine.set_visible(side in ("left", "bottom"))
-        self.ax.tick_params(colors=c["muted"], labelsize=8, which="both")
+        ax.tick_params(colors=c["muted"], labelsize=8, which="both")
 
-        self.ax.set_title("EQ Response", color=c["muted"], fontsize=10,
-                          fontweight="bold", loc="left", fontfamily=self.font_ui, pad=10)
-        self.ax.set_xlabel("Frequency (Hz)", color=c["muted"], fontsize=9)
-        self.ax.set_ylabel("Gain (dB)", color=c["muted"], fontsize=9)
-
+        ax.set_title("EQ Response", color=c["muted"], fontsize=10,
+                     fontweight="bold", loc="left", fontfamily=self.font_ui, pad=10)
+        ax.set_xlabel("Frequency (Hz)", color=c["muted"], fontsize=9)
+        ax.set_ylabel("Gain (dB)", color=c["muted"], fontsize=9)
         self.canvas_graph.draw_idle()
 
-    def _create_add_band(self):
-        self._snapshot()
-        self.create_filters.append(dict(NEW_BAND))
-        self.selected_filter = len(self.create_filters) - 1
-        self._refresh_create_tab()
-        self._load_selected_filter_into_editor()
-
-    def _create_delete_band(self):
+    def _on_list_select(self, _event):
         sel = self.filter_list.curselection()
-        if not sel:
+        if sel:
+            self.selected = sel[0]
+            self._load_editor_fields()
+            self._draw_graph()
+
+    def _load_editor_fields(self):
+        """Show the primary band's values in the fields (without re-applying them)."""
+        self._editor_recorded = False
+        if not 0 <= self.selected < len(self.filters):
             return
-
-        self._snapshot()
-        for index in sorted(sel, reverse=True):
-            del self.create_filters[index]
-
-        if not self.create_filters:
-            self.selected_filter = -1
-        else:
-            self.selected_filter = min(sel[0], len(self.create_filters) - 1)
-
-        self._refresh_create_tab()
-        self._load_selected_filter_into_editor()
-
-    def _create_delete_all_bands(self):
-        if not messagebox.askyesno("Delete All Bands", "Remove all EQ bands?"):
-            return
-
-        self._snapshot()
-        self.create_filters.clear()
-        self.selected_filter = -1
-        self._refresh_create_tab()
-
-        self.freq_var.set("")
-        self.gain_var.set("")
-        self.q_var.set("")
-        self.type_var.set("PK")
-
-    def _create_load_from_device(self):
-        if not messagebox.askyesno(
-                "Load EQ from Device",
-                "Load EQ from device? This will replace all current filters."):
-            return
-
-        max_filters = self._parse_int(self.max_filter_entry.get(), DEFAULT_MAX_FILTERS)
-
-        def task():
-            dev = self._open_selected_device()
-            try:
-                slot = get_current_slot(dev)
-                result = pull_from_device(
-                    dev, max_filters=max_filters, slot_hint=slot)
-            finally:
-                dev.close()
-
-            def apply():
-                self._snapshot()
-                loaded = [
-                    {
-                        "type": f.get("type", "PK"),
-                        "freq": float(f["freq"]) or 1000.0,
-                        "gain": float(f["gain"]),
-                        "q": float(f["q"]) or 1.0,
-                    }
-                    for f in result["filters"]
-                    if not f.get("disabled", False)
-                ]
-                self.create_filters = dedupe_filters(loaded)
-                self.selected_filter = 0 if self.create_filters else -1
-                self.create_preamp_entry.delete(0, "end")
-                self.create_preamp_entry.insert(0, str(result["globalGain"]))
-                self._refresh_create_tab()
-
-            self.after(0, apply)
-
-        self._run_bg(task)
-
-    def _create_select_band(self, _event):
-        sel = self.filter_list.curselection()
-        if not sel:
-            return
-        self.selected_filter = sel[0]
-        self._load_selected_filter_into_editor()
-        self._draw_response_graph()
-
-    def _load_selected_filter_into_editor(self):
-        """Show the primary selected band's values (without re-applying them)."""
-        self._editor_snapshot_taken = False
-        if not 0 <= self.selected_filter < len(self.create_filters):
-            return
-        f = self.create_filters[self.selected_filter]
-
+        f = self.filters[self.selected]
         self._loading_editor = True
         try:
-            self.freq_var.set(str(f["freq"]))
-            self.gain_var.set(str(f["gain"]))
-            if self.bw_mode.get():
-                q_val = max(float(f["q"]), 0.001)
-                bw = 2 * math.asinh(1 / (2 * q_val)) / math.log(2)
-                self.q_var.set(f"{bw:.3f}")
-            else:
-                self.q_var.set(str(f["q"]))
-            self.type_var.set(f["type"])
+            self.field_vars["freq"].set(str(f["freq"]))
+            self.field_vars["gain"].set(str(f["gain"]))
+            self.field_vars["q"].set(
+                f"{q_to_bw(float(f['q'])):.3f}" if self.bw_mode.get() else str(f["q"]))
+            self.field_vars["type"].set(f["type"])
         finally:
             self._loading_editor = False
 
-    def _apply_field_to_selection(self, field):
-        """Live-apply a single edited field to every selected band."""
+    def _clear_editor_fields(self):
+        self._loading_editor = True
+        try:
+            for field in ("freq", "gain", "q"):
+                self.field_vars[field].set("")
+            self.field_vars["type"].set("PK")
+        finally:
+            self._loading_editor = False
+
+    def _apply_field(self, field):
+        """Live-apply one edited field to every selected band."""
         if self._loading_editor:
             return
-        sel = self.filter_list.curselection() or (
-            (self.selected_filter,) if 0 <= self.selected_filter < len(self.create_filters)
-            else ())
+        sel = self._selection()
         if not sel:
             return
 
+        text = self.field_vars[field].get()
         if field == "type":
-            value = self.type_var.get()
-        elif field == "gain":
-            value = self._parse_float(self.gain_var.get())
-            if value is None:
+            value = text
+        else:
+            value = parse_float(text)
+            if value is None or (field != "gain" and value <= 0):
                 return
-        elif field == "freq":
-            value = self._parse_float(self.freq_var.get())
-            if value is None or value <= 0:
-                return
-        else:  # q (or bandwidth)
-            value = self._parse_float(self.q_var.get())
-            if value is None or value <= 0:
-                return
-            if self.bw_mode.get():
+            if field == "q" and self.bw_mode.get():
                 try:
-                    value = 1 / (2 * math.sinh(value * math.log(2) / 2))
+                    value = bw_to_q(value)
                 except OverflowError:
                     return
                 if value <= 0:
                     return
 
-        if not self._editor_snapshot_taken:
-            self._snapshot()
-            self._editor_snapshot_taken = True
-
+        if not self._editor_recorded:
+            self._record()
+            self._editor_recorded = True
         for i in sel:
-            self.create_filters[i][field] = value
+            self.filters[i][field] = value
 
         self._render_filter_rows()
         for i in sel:
             self.filter_list.selection_set(i)
-        self._draw_response_graph()
+        self._draw_graph()
 
     def _toggle_bw_mode(self):
-        val = self._parse_float(self.q_var.get())
+        in_bw = self.bw_mode.get()
+        self.q_label.config(text="Bandwidth (oct)" if in_bw else "Q")
+        val = parse_float(self.field_vars["q"].get())
         if val is None or val <= 0:
-            self.q_label.config(
-                text="Bandwidth (oct)" if self.bw_mode.get() else "Q")
             return
-
-        # Only the display unit changes here, not the underlying band, so
-        # suppress the live-apply trace while rewriting the field.
+        try:
+            converted = q_to_bw(val) if in_bw else bw_to_q(val)
+        except OverflowError:
+            return
+        # Only the display unit changes, not the band: don't live-apply.
         self._loading_editor = True
         try:
-            if self.bw_mode.get():
-                bw = 2 * math.asinh(1 / (2 * max(val, 0.001))) / math.log(2)
-                self.q_var.set(f"{bw:.3f}")
-                self.q_label.config(text="Bandwidth (oct)")
-            else:
-                try:
-                    q = 1 / (2 * math.sinh(val * math.log(2) / 2))
-                except OverflowError:
-                    self.q_label.config(text="Q")
-                    return
-                self.q_var.set(f"{q:.3f}")
-                self.q_label.config(text="Q")
+            self.field_vars["q"].set(f"{converted:.3f}")
         finally:
             self._loading_editor = False
 
     # ------------------------------------------------------------------
-    # Undo / redo
+    # Editor: band operations and undo
     # ------------------------------------------------------------------
 
-    def _capture_state(self):
-        return (copy.deepcopy(self.create_filters),
-                self.create_preamp_entry.get(),
-                self.selected_filter)
+    def set_filters(self, filters, preamp):
+        """Replace the whole EQ (one undo step): from a file, the device or AutoEQ."""
+        self._record()
+        self.filters = active_filters(filters)
+        self.selected = 0 if self.filters else -1
+        self._set_preamp(preamp)
+        self._refresh_editor()
+        self._load_editor_fields()
 
-    def _restore_state(self, state):
-        filters, preamp, sel = state
-        self.create_filters = filters
-        self.selected_filter = max(-1, min(sel, len(self.create_filters) - 1))
-        self.create_preamp_entry.delete(0, "end")
-        self.create_preamp_entry.insert(0, preamp)
-        self._refresh_create_tab()
-        self._load_selected_filter_into_editor()
+    def _add_band(self):
+        self._record()
+        self.filters.append(dict(NEW_BAND))
+        self.selected = len(self.filters) - 1
+        self._refresh_editor()
+        self._load_editor_fields()
 
-    def _snapshot(self):
-        self._undo_stack.append(self._capture_state())
-        self._redo_stack.clear()
+    def _remove_bands(self, indices):
+        self._record()
+        for index in sorted(indices, reverse=True):
+            del self.filters[index]
+        self.selected = min(min(indices), len(self.filters) - 1) if self.filters else -1
+        self._refresh_editor()
+        self._load_editor_fields()
 
-    def _undo(self, _event=None):
-        if not self._undo_stack:
+    def _delete_selected_bands(self):
+        sel = self.filter_list.curselection()
+        if sel:
+            self._remove_bands(sel)
+
+    def _delete_all_bands(self):
+        if not messagebox.askyesno("Delete All Bands", "Remove all EQ bands?"):
             return
-        self._redo_stack.append(self._capture_state())
-        self._restore_state(self._undo_stack.pop())
+        self._record()
+        self.filters.clear()
+        self.selected = -1
+        self._refresh_editor()
+        self._clear_editor_fields()
 
-    def _redo(self, _event=None):
-        if not self._redo_stack:
-            return
-        self._undo_stack.append(self._capture_state())
-        self._restore_state(self._redo_stack.pop())
+    def _capture(self):
+        return copy.deepcopy(self.filters), self.preamp_spin.get(), self.selected
+
+    def _restore(self, state):
+        filters, preamp, selected = state
+        self.filters = filters
+        self.selected = max(-1, min(selected, len(filters) - 1))
+        self._set_preamp(preamp)
+        self._refresh_editor()
+        self._load_editor_fields()
+
+    def _record(self):
+        self.history.record(self._capture())
+
+    def _undo(self):
+        state = self.history.undo(self._capture())
+        if state is not None:
+            self._restore(state)
+
+    def _redo(self):
+        state = self.history.redo(self._capture())
+        if state is not None:
+            self._restore(state)
 
     # ------------------------------------------------------------------
-    # Mouse drag-and-drop graph controls
+    # Editor: mouse on the graph
     # ------------------------------------------------------------------
 
-    def _find_closest_filter(self, event, max_pixels=14):
-        """Index of the band nearest the cursor in screen pixels, or -1."""
+    def _band_at(self, event, max_pixels=14):
+        """Index of the band handle nearest the cursor within `max_pixels`, or -1."""
         if event.x is None or event.y is None:
             return -1
-
-        best_idx = -1
-        best_dist = float("inf")
-        for i, f in enumerate(self.create_filters):
-            try:
-                px = float(f.get("freq", 0))
-                py = float(f.get("gain", 0))
-            except (ValueError, TypeError):
-                continue
-            if px <= 0:
-                continue
-            try:
-                disp_x, disp_y = self.ax.transData.transform((px, py))
-            except (ValueError, TypeError):
-                continue
-            dist = math.hypot(disp_x - event.x, disp_y - event.y)
+        best_idx, best_dist = -1, float("inf")
+        for i, f in enumerate(self.filters):
+            x, y = self.ax.transData.transform((f["freq"], f["gain"]))
+            dist = math.hypot(x - event.x, y - event.y)
             if dist < best_dist:
-                best_dist = dist
-                best_idx = i
-
+                best_idx, best_dist = i, dist
         return best_idx if best_dist <= max_pixels else -1
 
     def _on_press(self, event):
-        if event.xdata is None or event.ydata is None:
+        if event.xdata is None or event.ydata is None or not 20 <= event.xdata <= 20000:
             return
-
-        freq = float(event.xdata)
-        gain = float(event.ydata)
-        if freq < 20 or freq > 20000:
-            return
-
         if event.button == 3:
-            self._on_right_click_graph(event)
+            self._on_right_click(event)
             return
 
-        closest_idx = self._find_closest_filter(event)
-        if closest_idx >= 0:
-            # Grab an existing band. Don't snapshot yet: a plain selecting click
-            # should not create an undo step. The snapshot is taken lazily on
-            # the first actual drag move.
-            self.selected_filter = closest_idx
-            self._dragging_point_idx = closest_idx
-            self._drag_snapshot_taken = False
-            self._load_selected_filter_into_editor()
-            self._draw_response_graph()
+        index = self._band_at(event)
+        if index >= 0:
+            # Grab an existing band. A plain selecting click must not create an
+            # undo step, so the snapshot waits for the first actual drag move.
+            self._drag_recorded = False
+            self.selected = index
+            self._load_editor_fields()
+            self._draw_graph()
         else:
-            self._snapshot()
-            self.create_filters.append({
-                "type": "PK", "freq": round(freq, 1), "gain": round(gain, 1), "q": 1.0,
-            })
-            self.selected_filter = len(self.create_filters) - 1
-            self._dragging_point_idx = self.selected_filter
-            # The pre-append snapshot already covers creating and positioning
-            # this new band as a single undo step.
-            self._drag_snapshot_taken = True
-            self._refresh_create_tab()
-            self._load_selected_filter_into_editor()
+            # Create a band; the pre-append snapshot also covers dragging it.
+            self._record()
+            self._drag_recorded = True
+            self.filters.append({"type": "PK", "freq": round(float(event.xdata), 1),
+                                 "gain": round(float(event.ydata), 1), "q": 1.0})
+            self.selected = index = len(self.filters) - 1
+            self._refresh_editor()
+            self._load_editor_fields()
+        self._drag_idx = index
 
     def _on_motion(self, event):
-        if self._dragging_point_idx is None:
+        if self._drag_idx is None or event.xdata is None or event.ydata is None:
             return
-        if event.xdata is None or event.ydata is None:
-            return
-
-        freq = max(20.0, min(20000.0, float(event.xdata)))
-        gain = max(-15.0, min(15.0, float(event.ydata)))
-
-        # Record the pre-drag state once, so the whole drag is one undo step.
-        if not self._drag_snapshot_taken:
-            self._snapshot()
-            self._drag_snapshot_taken = True
-
-        self.create_filters[self._dragging_point_idx]["freq"] = round(freq, 1)
-        self.create_filters[self._dragging_point_idx]["gain"] = round(gain, 1)
-
-        self._load_selected_filter_into_editor()
-        self._draw_response_graph()
+        if not self._drag_recorded:  # whole drag = one undo step
+            self._record()
+            self._drag_recorded = True
+        band = self.filters[self._drag_idx]
+        band["freq"] = round(max(20.0, min(20000.0, float(event.xdata))), 1)
+        band["gain"] = round(max(-GRAPH_GAIN_LIMIT, min(GRAPH_GAIN_LIMIT, float(event.ydata))), 1)
+        self._load_editor_fields()
+        self._draw_graph()
 
     def _on_release(self, _event):
-        if self._dragging_point_idx is not None:
-            self._dragging_point_idx = None
-            self._drag_snapshot_taken = False
-            self._refresh_create_tab()
+        if self._drag_idx is not None:
+            self._drag_idx = None
+            self._drag_recorded = False
+            self._refresh_editor()
 
-    def _on_right_click_graph(self, event):
-        if not self.create_filters:
-            return
-        closest_idx = self._find_closest_filter(event)
-        if closest_idx < 0:
-            return
-
-        f = self.create_filters[closest_idx]
-        if not messagebox.askyesno(
+    def _on_right_click(self, event):
+        index = self._band_at(event)
+        if index >= 0 and messagebox.askyesno(
                 "Delete Band",
-                f"Delete band {closest_idx + 1} ({float(f['freq']):.1f} Hz)?"):
-            return
-
-        self._snapshot()
-        del self.create_filters[closest_idx]
-        if not self.create_filters:
-            self.selected_filter = -1
-        else:
-            self.selected_filter = min(closest_idx, len(self.create_filters) - 1)
-
-        self._refresh_create_tab()
-        self._load_selected_filter_into_editor()
+                f"Delete band {index + 1} ({self.filters[index]['freq']:.1f} Hz)?"):
+            self._remove_bands([index])
 
     # ------------------------------------------------------------------
-    # Push / save / load profile
+    # Files
     # ------------------------------------------------------------------
 
-    def _create_push(self, then=None):
-        if not self.create_filters:
+    def _save_profile(self, then=None):
+        if not self.filters:
             messagebox.showwarning("No Filters", "Add at least one EQ band first.")
             return
-
-        slot = self._parse_int(self.create_slot_spin.get(), 0)
-        preamp = self._parse_float(self.create_preamp_entry.get(), 0)
-        buffer_db = self._parse_float(
-            self.create_buffer_entry.get(), DEFAULT_GLOBAL_GAIN_BUFFER)
-        max_filters = self._parse_int(self.max_filter_entry.get(), DEFAULT_MAX_FILTERS)
-
-        if len(self.create_filters) > max_filters:
-            self._confirm_filter_overflow(slot, preamp, buffer_db, max_filters, then=then)
-            return
-
-        self._do_push(slot, preamp, buffer_db, max_filters, then=then)
-
-    def _confirm_filter_overflow(self, slot, preamp, buffer_db, max_filters, then=None):
-        dlg = tk.Toplevel(self)
-        dlg.title("Too Many Bands")
-        dlg.configure(bg=THEME["chassis"])
-        dlg.transient(self)
-        dlg.resizable(False, False)
-
-        msg = (
-            f"You have {len(self.create_filters)} EQ bands, but the device is "
-            f"set to support only {max_filters} filter slot(s) (see 'Max filters').\n\n"
-            f"Writing more bands than your hardware supports will only write the "
-            f"first {max_filters} band(s) to the device — the rest will be silently "
-            f"dropped.\n\n"
-            f"Reduce your EQ to {max_filters} band(s), correct 'Max filters' to "
-            f"match your device, or push anyway (will break your EQ). Filters with 0 gain are ignored and will not be written to the device."
-        )
-        ttk.Label(dlg, text=msg, wraplength=420, justify="left").pack(
-            padx=24, pady=(20, 16))
-
-        row = ttk.Frame(dlg)
-        row.pack(padx=16, pady=(0, 18))
-
-        def choose(action):
-            dlg.destroy()
-            if action == "push":
-                self._do_push(slot, preamp, buffer_db, max_filters, then=then)
-            # "cancel" just closes the dialog
-
-        cancel_btn = ttk.Button(row, text="Cancel", command=lambda: choose("cancel"))
-        cancel_btn.pack(side="left", padx=4)
-        ttk.Button(row, text="Push Anyway", style="Danger.TButton",
-                   command=lambda: choose("push")).pack(side="left", padx=4)
-
-        dlg.bind("<Escape>", lambda _e: choose("cancel"))
-        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
-        dlg.grab_set()
-        dlg.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
-        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-        cancel_btn.focus_set()
-
-    def _do_push(self, slot, preamp, buffer_db, max_filters, then=None):
-        # Pad with inert (gain-0) dummy bands up to the device's slot count, so
-        # the device doesn't backfill the unused tail slots with copies of the
-        # last real band.
-        filters = [dict(f) for f in self.create_filters]
-        while len(filters) < max_filters:
-            filters.append(dict(INERT_FILTER))
-
-        def task():
-            dev = self._open_selected_device()
-            try:
-                push_to_device(dev, slot=slot, global_gain=preamp, filters=filters,
-                               buffer_db=buffer_db, write_gain=True)
-                enable_peq(dev, True, slot_id=slot)
-                print(f"Created EQ pushed to device on slot {slot} "
-                      f"({len(filters)} slots)")
-            finally:
-                dev.close()
-            if then is not None:
-                self.after(0, then)  # only reached when the push succeeded
-
-        self._run_bg(task)
-
-    def _create_save_profile(self, then=None):
-        if not self.create_filters:
-            messagebox.showwarning("No Filters", "Add at least one EQ band first.")
-            return
-
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+        path = filedialog.asksaveasfilename(defaultextension=".txt",
+                                            filetypes=FILE_TYPES_PROFILE)
         if not path:
             return
-
-        preamp = self._parse_float(self.create_preamp_entry.get(), 0.0)
         try:
-            save_profile(path, preamp, self.create_filters)
-            self._log(f"Profile saved to {path}\n")
+            save_profile(path, parse_float(self.preamp_spin.get(), 0.0), self.filters)
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
             return
+        self.log(f"Profile saved to {path}\n")
         if then is not None:
             then()
 
-    def _create_load_profile(self):
-        path = filedialog.askopenfilename(
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+    def _load_profile(self):
+        path = filedialog.askopenfilename(filetypes=FILE_TYPES_PROFILE)
         if not path:
             return
-
         try:
             data = load_profile(path)
         except Exception as e:
             messagebox.showerror("Load Error", str(e))
             return
-
-        self._snapshot()
-        loaded = [
-            {
-                "type": f.get("type", "PK"),
-                "freq": float(f["freq"]) or 1000.0,
-                "gain": float(f["gain"]),
-                "q": float(f["q"]) or 1.0,
-            }
-            for f in data["filters"]
-            if not f.get("disabled", is_filter_disabled(
-                f.get("type", "PK"), f["freq"], f["gain"], f["q"]))
-        ]
-        self.create_filters = dedupe_filters(loaded)
-        self.selected_filter = 0 if self.create_filters else -1
-
-        self.create_preamp_entry.delete(0, "end")
-        self.create_preamp_entry.insert(0, str(data["preamp"]))
-
-        self._refresh_create_tab()
-        self._load_selected_filter_into_editor()
-        self._log(f"Loaded {len(self.create_filters)} filter(s) from {path}\n")
+        self.set_filters(data["filters"], data["preamp"])
+        self.log(f"Loaded {len(self.filters)} filter(s) from {path}\n")
 
     # ------------------------------------------------------------------
-    # AutoEQ
-    # ------------------------------------------------------------------
-
-    def _show_busy_dialog(self, title, message):
-        """Modal indeterminate-progress dialog for a background task.
-
-        Caller is responsible for calling .destroy() on the returned Toplevel
-        (from the main thread, e.g. via self.after(0, ...)) once done.
-        """
-        dlg = tk.Toplevel(self)
-        dlg.title(title)
-        dlg.configure(bg=THEME["chassis"])
-        dlg.transient(self)
-        dlg.resizable(False, False)
-
-        ttk.Label(dlg, text=message, wraplength=320, justify="left").pack(
-            padx=24, pady=(20, 10))
-        bar = ttk.Progressbar(dlg, mode="indeterminate", length=280)
-        bar.pack(padx=24, pady=(0, 20))
-        bar.start(12)
-
-        dlg.protocol("WM_DELETE_WINDOW", lambda: None)  # not user-closable
-        dlg.grab_set()
-        dlg.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
-        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-        return dlg
-
-    def _create_autoeq(self):
-        self._pick_autoeq_model(self._on_autoeq_model_chosen)
-
-    def _on_autoeq_model_chosen(self, measurement_path, _entry=None):
-        if not measurement_path:
-            return
-
-        try:
-            measurement = parse_frequency_response_file(measurement_path)
-        except Exception as e:
-            messagebox.showerror("AutoEQ", f"Could not read measurement file:\n{e}")
-            return
-
-        self._pick_autoeq_target(
-            lambda target_points: self._run_autoeq(measurement, target_points))
-
-    def _create_load_autoeq_profile(self):
-        """Skip running the optimizer: fetch a ParametricEQ.txt the AutoEQ
-        project has already computed for a model, straight from GitHub."""
-        self._pick_autoeq_model(self._on_precomputed_model_chosen)
-
-    def _on_precomputed_model_chosen(self, path, entry):
-        if not path:
-            return
-        if not entry or not entry.get("remote"):
-            messagebox.showinfo(
-                "Pre-computed Profile",
-                "Pre-computed profiles are only available for models picked "
-                "from the online AutoEQ database, not local files/folders.")
-            return
-
-        # entry["path"] looks like "measurements/<source>/data/<category>/<model>.csv"
-        parts = entry["path"].split("/")
-        if len(parts) < 2:
-            messagebox.showerror(
-                "Pre-computed Profile", "Could not determine the measurement source.")
-            return
-        source = parts[1]
-        model_stem = entry["label"]
-
-        busy = self._show_busy_dialog(
-            "Pre-computed Profile",
-            f"Looking up pre-computed EQ profile(s) for {model_stem}...")
-
-        def task():
-            try:
-                candidates = fetch_autoeq_precomputed_profiles(source, model_stem)
-            except Exception as e:
-                def fail():
-                    busy.destroy()
-                    messagebox.showerror("Pre-computed Profile", f"Lookup failed:\n{e}")
-                self.after(0, fail)
-                return
-
-            def after_lookup():
-                busy.destroy()
-                if not candidates:
-                    messagebox.showinfo(
-                        "Pre-computed Profile",
-                        f"No pre-computed ParametricEQ.txt found for {model_stem} "
-                        f"under '{source}'.")
-                    return
-                self._choose_and_load_precomputed(candidates)
-            self.after(0, after_lookup)
-
-        self._run_bg(task)
-
-    def _choose_and_load_precomputed(self, candidates):
-        if len(candidates) == 1:
-            self._download_and_load_precomputed(candidates[0])
-            return
-
-        dlg = tk.Toplevel(self)
-        dlg.title("Select Target Variant")
-        dlg.configure(bg=THEME["chassis"])
-        dlg.transient(self)
-        dlg.resizable(False, False)
-
-        ttk.Label(dlg, text="Multiple pre-computed variants found — pick one:").pack(
-            padx=20, pady=(16, 8))
-
-        listbox = tk.Listbox(
-            dlg, height=min(8, len(candidates)), width=50,
-            bg=THEME["panel"], fg=THEME["ink"],
-            selectbackground=THEME["accent"], selectforeground=THEME["chassis"],
-            highlightthickness=1, highlightbackground=THEME["line"],
-            borderwidth=0, activestyle="none", font=(self.font_ui, 10))
-        for c in candidates:
-            listbox.insert("end", c["label"])
-        listbox.selection_set(0)
-        listbox.pack(padx=20, pady=(0, 12), fill="both", expand=True)
-
-        row = ttk.Frame(dlg)
-        row.pack(pady=(0, 16))
-
-        def choose():
-            sel = listbox.curselection()
-            dlg.destroy()
-            if sel:
-                self._download_and_load_precomputed(candidates[sel[0]])
-
-        def cancel():
-            dlg.destroy()
-
-        ttk.Button(row, text="Cancel", command=cancel).pack(side="left", padx=4)
-        ttk.Button(row, text="Load", style="Accent.TButton", command=choose).pack(
-            side="left", padx=4)
-        listbox.bind("<Double-Button-1>", lambda _e: choose())
-
-        dlg.protocol("WM_DELETE_WINDOW", cancel)
-        dlg.grab_set()
-        dlg.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
-        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-
-    def _download_and_load_precomputed(self, candidate):
-        busy = self._show_busy_dialog(
-            "Pre-computed Profile", f"Downloading {candidate['label']}...")
-
-        def task():
-            try:
-                local_path = fetch_autoeq_remote_file(candidate["path"])
-                data = load_profile(local_path)
-            except Exception as e:
-                def fail():
-                    busy.destroy()
-                    messagebox.showerror(
-                        "Pre-computed Profile", f"Could not load profile:\n{e}")
-                self.after(0, fail)
-                return
-
-            def apply():
-                busy.destroy()
-                self._snapshot()
-                loaded = [
-                    {
-                        "type": f.get("type", "PK"),
-                        "freq": float(f["freq"]) or 1000.0,
-                        "gain": float(f["gain"]),
-                        "q": float(f["q"]) or 1.0,
-                    }
-                    for f in data["filters"]
-                    if not f.get("disabled", is_filter_disabled(
-                        f.get("type", "PK"), f["freq"], f["gain"], f["q"]))
-                ]
-                self.create_filters = dedupe_filters(loaded)
-                self.selected_filter = 0 if self.create_filters else -1
-                self.create_preamp_entry.delete(0, "end")
-                self.create_preamp_entry.insert(0, str(data["preamp"]))
-                self._refresh_create_tab()
-                self._load_selected_filter_into_editor()
-                self._log(f"Loaded pre-computed profile ({candidate['label']})\n")
-            self.after(0, apply)
-
-        self._run_bg(task)
-
-    def _pick_autoeq_target(self, callback):
-        """Ask flat vs. a target searched from AutoEQ's online library vs. a
-        local file. Eventually calls callback(target_points_or_None); None
-        means flat. Silently does nothing further if the user cancels.
-        """
-        choice = self._prompt_for_target_source()
-        if choice is None:
-            return
-        if choice == "flat":
-            callback(None)
-            return
-        if choice == "online":
-            def after_fetch():
-                path = self._show_target_search_dialog()
-                if not path:
-                    return
-                try:
-                    callback(parse_frequency_response_file(path))
-                except Exception as e:
-                    messagebox.showerror("AutoEQ", f"Could not read target file:\n{e}")
-            self._fetch_autoeq_targets(after_fetch)
-            return
-
-        # choice == "file"
-        target_path = filedialog.askopenfilename(
-            title="Select Target Curve File (freq, dB per line)",
-            filetypes=[("Text/CSV files", "*.txt *.csv"), ("All files", "*.*")])
-        if not target_path:
-            return
-        try:
-            callback(parse_frequency_response_file(target_path))
-        except Exception as e:
-            messagebox.showerror("AutoEQ", f"Could not read target file:\n{e}")
-
-    def _prompt_for_target_source(self):
-        """Ask 'flat' vs. 'online target library' vs. 'local file'. Returns
-        'flat'/'online'/'file'/None."""
-        dlg = tk.Toplevel(self)
-        dlg.title("AutoEQ Target")
-        dlg.configure(bg=THEME["chassis"])
-        dlg.transient(self)
-        dlg.resizable(False, False)
-
-        ttk.Label(dlg, wraplength=380, justify="left", text=(
-            "Choose the target curve AutoEQ should reshape your measurement "
-            "towards."
-        )).pack(padx=24, pady=(20, 16))
-
-        result = {"choice": None}
-        row = ttk.Frame(dlg)
-        row.pack(padx=16, pady=(0, 18))
-
-        def choose(c):
-            result["choice"] = c
-            dlg.destroy()
-
-        ttk.Button(row, text="Flat (0 dB)", command=lambda: choose("flat")).pack(
-            side="left", padx=4)
-        ttk.Button(row, text="Search AutoEQ Targets...", style="Accent.TButton",
-                   command=lambda: choose("online")).pack(side="left", padx=4)
-        ttk.Button(row, text="Load Target File...",
-                   command=lambda: choose("file")).pack(side="left", padx=4)
-        ttk.Button(row, text="Cancel", command=lambda: choose(None)).pack(
-            side="left", padx=4)
-
-        dlg.bind("<Escape>", lambda _e: choose(None))
-        dlg.protocol("WM_DELETE_WINDOW", lambda: choose(None))
-        dlg.grab_set()
-        dlg.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
-        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-        self.wait_window(dlg)
-        return result["choice"]
-
-    def _fetch_autoeq_targets(self, on_ready):
-        """Fetch (and memoize for this session) AutoEQ's target-curve list."""
-        if self._autoeq_target_index is not None:
-            on_ready()
-            return
-
-        busy = self._show_busy_dialog(
-            "AutoEQ Targets", "Fetching target curve list from GitHub...")
-
-        def task():
-            print("Fetching AutoEQ target curve list from GitHub...")
-            try:
-                index = fetch_autoeq_targets_index()
-            except Exception as e:
-                def fail():
-                    busy.destroy()
-                    messagebox.showerror(
-                        "AutoEQ Targets", f"Could not fetch the target list:\n{e}")
-                self.after(0, fail)
-                return
-
-            print(f"Fetched {len(index)} target curve(s).")
-
-            def apply():
-                busy.destroy()
-                self._autoeq_target_index = index
-                on_ready()
-            self.after(0, apply)
-
-        self._run_bg(task)
-
-    def _show_target_search_dialog(self):
-        c = THEME
-        dlg = tk.Toplevel(self)
-        dlg.title("Search AutoEQ Targets")
-        dlg.configure(bg=c["chassis"])
-        dlg.transient(self)
-        dlg.geometry("620x440")
-        dlg.minsize(560, 340)
-
-        result = {"path": None}
-        filtered = []
-
-        top = ttk.Frame(dlg)
-        top.pack(fill="x", padx=12, pady=(12, 6))
-        ttk.Label(top, text="Search:").pack(side="left")
-        search_var = tk.StringVar()
-        entry = ttk.Entry(top, textvariable=search_var)
-        entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
-
-        list_frame = ttk.Frame(dlg)
-        list_frame.pack(fill="both", expand=True, padx=12, pady=6)
-        listbox = tk.Listbox(
-            list_frame, bg=c["panel"], fg=c["ink"],
-            selectbackground=c["accent"], selectforeground=c["chassis"],
-            highlightthickness=1, highlightbackground=c["line"],
-            borderwidth=0, activestyle="none", font=(self.font_ui, 10))
-        listbox.pack(side="left", fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
-        scrollbar.pack(side="right", fill="y")
-        listbox.configure(yscrollcommand=scrollbar.set)
-
-        status_var = tk.StringVar()
-        ttk.Label(dlg, textvariable=status_var, style="Muted.TLabel").pack(
-            anchor="w", padx=12)
-
-        def refresh_list(*_args):
-            query = search_var.get().strip().lower()
-            listbox.delete(0, "end")
-            nonlocal filtered
-            if query:
-                terms = query.split()
-                filtered = [
-                    e for e in self._autoeq_target_index
-                    if all(t in e["label"].lower() for t in terms)
-                ]
-            else:
-                filtered = list(self._autoeq_target_index)
-            for e in filtered[:300]:
-                listbox.insert("end", e["label"])
-            status_var.set(
-                f"{len(filtered)} match(es)"
-                + (" (showing first 300)" if len(filtered) > 300 else ""))
-
-        def choose(_event=None):
-            sel = listbox.curselection()
-            if not sel or sel[0] >= len(filtered):
-                return
-            entry_data = filtered[sel[0]]
-
-            select_btn.configure(state="disabled")
-            status_var.set(f"Downloading {entry_data['label']}...")
-
-            def task():
-                try:
-                    local_path = fetch_autoeq_remote_file(entry_data["path"])
-                except Exception as e:
-                    def fail():
-                        messagebox.showerror(
-                            "AutoEQ", f"Could not download target:\n{e}")
-                        select_btn.configure(state="normal")
-                        refresh_list()
-                    self.after(0, fail)
-                    return
-
-                def done():
-                    result["path"] = local_path
-                    dlg.destroy()
-                self.after(0, done)
-
-            self._run_bg(task)
-
-        def cancel():
-            dlg.destroy()
-
-        search_var.trace_add("write", refresh_list)
-        listbox.bind("<Double-Button-1>", choose)
-        entry.bind("<Return>", lambda _e: choose() if filtered else None)
-        entry.bind("<Down>", lambda _e: (listbox.focus_set(), listbox.selection_set(0)))
-        dlg.bind("<Escape>", lambda _e: cancel())
-
-        row = ttk.Frame(dlg)
-        row.pack(fill="x", padx=12, pady=(6, 12))
-        ttk.Button(row, text="Cancel", command=cancel).pack(side="right", padx=4)
-        select_btn = ttk.Button(row, text="Select", style="Accent.TButton", command=choose)
-        select_btn.pack(side="right", padx=4)
-
-        refresh_list()
-        if filtered:
-            listbox.selection_set(0)
-
-        dlg.protocol("WM_DELETE_WINDOW", cancel)
-        dlg.grab_set()
-        entry.focus_set()
-
-        dlg.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
-        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-
-        self.wait_window(dlg)
-        return result["path"]
-
-    def _run_autoeq(self, measurement, target_points):
-        max_filters = self._parse_int(self.max_filter_entry.get(), DEFAULT_MAX_FILTERS)
-
-        busy = self._show_busy_dialog(
-            "AutoEQ",
-            "Running AutoEQ optimization...\nThis can take up to a minute "
-            "depending on the number of filters.")
-
-        def task():
-            print("Running AutoEQ optimization, this may take a while...")
-            try:
-                freqs = autoeq_raw_frequencies()
-                fr = autoeq_interp(freqs, measurement)
-                fr_target = (
-                    [(f, 0.0) for f in freqs] if target_points is None
-                    else autoeq_interp(freqs, target_points))
-
-                # Loudness-normalize both curves before comparing them:
-                # otherwise two curves that each use a different absolute dB
-                # reference convention — as different measurement sources/rigs
-                # do — get compared directly, and the optimizer chases a
-                # systematic level offset instead of shape.
-                fr = autoeq_loudness_normalize(fr)
-                fr_target = autoeq_loudness_normalize(fr_target)
-
-                filters = autoeq_run(fr, fr_target, max_filters)
-                fr_eq = autoeq_apply(fr, filters)
-                preamp = autoeq_calc_preamp(fr, fr_eq)
-            except Exception:
-                self.after(0, busy.destroy)
-                raise
-            print(f"AutoEQ generated {len(filters)} band(s), preamp {preamp:.1f} dB")
-
-            def apply_result():
-                busy.destroy()
-                self._snapshot()
-                self.create_filters = [
-                    {
-                        "type": f["type"],
-                        "freq": round(f["freq"], 1),
-                        "gain": round(f["gain"], 2),
-                        "q": round(f["q"], 3),
-                    }
-                    for f in filters
-                ]
-                self.selected_filter = 0 if self.create_filters else -1
-                self.create_preamp_entry.delete(0, "end")
-                self.create_preamp_entry.insert(0, f"{preamp:.1f}")
-                self._refresh_create_tab()
-                self._load_selected_filter_into_editor()
-
-            self.after(0, apply_result)
-
-        self._run_bg(task)
-
-    def _pick_autoeq_model(self, callback):
-        """Search a measurement database by model name, à la autoeq.app.
-
-        Eventually calls `callback(measurement_path_or_None, index_entry_or_None)`
-        — asynchronously when fetching the online database, since that hits
-        the network. `index_entry` is None for a manually browsed file, or
-        for a local-folder pick; only online-database picks carry one (used
-        to look up a pre-computed profile for the same model, if wanted).
-        """
-        if self._autoeq_model_index is not None:
-            callback(*self._show_model_search_dialog())
-            return
-
-        saved = load_autoeq_db_path()
-        if saved == "online":
-            self._fetch_online_index(lambda: callback(*self._show_model_search_dialog()))
-            return
-        if saved and os.path.isdir(saved):
-            self._ensure_local_autoeq_index(saved)
-            callback(*self._show_model_search_dialog())
-            return
-
-        choice = self._prompt_for_autoeq_source()
-        if choice is None:
-            callback(None, None)
-            return
-        if choice == "online":
-            self._fetch_online_index(lambda: callback(*self._show_model_search_dialog()))
-            return
-
-        chosen = filedialog.askdirectory(title="Select Measurement Database Folder")
-        if not chosen:
-            callback(None, None)
-            return
-        save_autoeq_db_path(chosen)
-        self._ensure_local_autoeq_index(chosen)
-        callback(*self._show_model_search_dialog())
-
-    def _prompt_for_autoeq_source(self):
-        """Ask 'online database' vs 'local folder'. Returns 'online'/'local'/None."""
-        dlg = tk.Toplevel(self)
-        dlg.title("AutoEQ Model Database")
-        dlg.configure(bg=THEME["chassis"])
-        dlg.transient(self)
-        dlg.resizable(False, False)
-
-        ttk.Label(dlg, wraplength=380, justify="left", text=(
-            "No measurement database is configured yet.\n\n"
-            "Fetch the online AutoEQ database from GitHub "
-            "(jaakkopasanen/AutoEq), or point to a local folder of "
-            "measurement .txt files instead."
-        )).pack(padx=24, pady=(20, 16))
-
-        result = {"choice": None}
-        row = ttk.Frame(dlg)
-        row.pack(padx=16, pady=(0, 18))
-
-        def choose(c):
-            result["choice"] = c
-            dlg.destroy()
-
-        ttk.Button(row, text="Download Online Database", style="Accent.TButton",
-                   command=lambda: choose("online")).pack(side="left", padx=4)
-        ttk.Button(row, text="Choose Local Folder...",
-                   command=lambda: choose("local")).pack(side="left", padx=4)
-        ttk.Button(row, text="Cancel", command=lambda: choose(None)).pack(
-            side="left", padx=4)
-
-        dlg.bind("<Escape>", lambda _e: choose(None))
-        dlg.protocol("WM_DELETE_WINDOW", lambda: choose(None))
-        dlg.grab_set()
-        dlg.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
-        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-        self.wait_window(dlg)
-        return result["choice"]
-
-    def _ensure_local_autoeq_index(self, db_path):
-        self._autoeq_db_path = db_path
-        if self._autoeq_model_index is None or self._autoeq_model_index_path != db_path:
-            self._autoeq_model_index = build_autoeq_model_index(db_path)
-            self._autoeq_model_index_path = db_path
-
-    def _fetch_online_index(self, on_ready):
-        """Fetch the online index in the background; calls on_ready() when set."""
-        busy = self._show_busy_dialog(
-            "AutoEQ Model Database", "Fetching model list from GitHub...")
-
-        def task():
-            print("Fetching AutoEQ database listing from GitHub...")
-            try:
-                index = fetch_autoeq_online_index()
-            except Exception as e:
-                def fail():
-                    busy.destroy()
-                    messagebox.showerror(
-                        "AutoEQ Model Database",
-                        f"Could not fetch the online database:\n{e}")
-                self.after(0, fail)
-                return
-
-            print(f"Fetched {len(index)} model(s) from the online database.")
-
-            def apply():
-                busy.destroy()
-                self._autoeq_model_index = index
-                self._autoeq_model_index_path = "online"
-                self._autoeq_db_path = "online"
-                save_autoeq_db_path("online")
-                on_ready()
-            self.after(0, apply)
-
-        self._run_bg(task)
-
-    def _show_model_search_dialog(self):
-        c = THEME
-        dlg = tk.Toplevel(self)
-        dlg.title("Search Headphone Model")
-        dlg.configure(bg=c["chassis"])
-        dlg.transient(self)
-        dlg.geometry("700x480")
-        dlg.minsize(650, 360)
-
-        result = {"path": None, "entry": None}
-        filtered = []
-
-        top = ttk.Frame(dlg)
-        top.pack(fill="x", padx=12, pady=(12, 6))
-        ttk.Label(top, text="Search:").pack(side="left")
-        search_var = tk.StringVar()
-        entry = ttk.Entry(top, textvariable=search_var)
-        entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
-
-        list_frame = ttk.Frame(dlg)
-        list_frame.pack(fill="both", expand=True, padx=12, pady=6)
-        listbox = tk.Listbox(
-            list_frame, bg=c["panel"], fg=c["ink"],
-            selectbackground=c["accent"], selectforeground=c["chassis"],
-            highlightthickness=1, highlightbackground=c["line"],
-            borderwidth=0, activestyle="none", font=(self.font_ui, 10))
-        listbox.pack(side="left", fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
-        scrollbar.pack(side="right", fill="y")
-        listbox.configure(yscrollcommand=scrollbar.set)
-
-        status_var = tk.StringVar()
-        ttk.Label(dlg, textvariable=status_var, style="Muted.TLabel").pack(
-            anchor="w", padx=12)
-
-        def refresh_list(*_args):
-            query = search_var.get().strip().lower()
-            listbox.delete(0, "end")
-            nonlocal filtered
-            if query:
-                terms = query.split()
-                filtered = [
-                    e for e in self._autoeq_model_index
-                    if all(t in e["label"].lower() or t in e["subtitle"].lower()
-                           for t in terms)
-                ]
-            else:
-                filtered = list(self._autoeq_model_index)
-            for e in filtered[:300]:
-                listbox.insert("end", f"{e['label']}   [{e['subtitle']}]")
-            status_var.set(
-                f"{len(filtered)} match(es) in {os.path.basename(self._autoeq_db_path)}"
-                + (" (showing first 300)" if len(filtered) > 300 else ""))
-
-        def choose(_event=None):
-            sel = listbox.curselection()
-            if not sel or sel[0] >= len(filtered):
-                return
-            entry_data = filtered[sel[0]]
-
-            if not entry_data.get("remote"):
-                result["path"] = entry_data["path"]
-                result["entry"] = entry_data
-                dlg.destroy()
-                return
-
-            select_btn.configure(state="disabled")
-            status_var.set(f"Downloading {entry_data['label']}...")
-
-            def task():
-                try:
-                    local_path = fetch_autoeq_remote_file(entry_data["path"])
-                except Exception as e:
-                    def fail():
-                        messagebox.showerror(
-                            "AutoEQ", f"Could not download measurement:\n{e}")
-                        select_btn.configure(state="normal")
-                        refresh_list()
-                    self.after(0, fail)
-                    return
-
-                def done():
-                    result["path"] = local_path
-                    result["entry"] = entry_data
-                    dlg.destroy()
-                self.after(0, done)
-
-            self._run_bg(task)
-
-        def cancel():
-            dlg.destroy()
-
-        def browse_file():
-            path = filedialog.askopenfilename(
-                title="Select Measurement File (freq, dB per line)",
-                filetypes=[("Text/CSV files", "*.txt *.csv"), ("All files", "*.*")])
-            if path:
-                result["path"] = path
-                result["entry"] = None
-                dlg.destroy()
-
-        def change_db():
-            choice = self._prompt_for_autoeq_source()
-            if choice is None:
-                return
-            if choice == "online":
-                status_var.set("Fetching online database...")
-                self._fetch_online_index(refresh_list)
-                return
-            chosen = filedialog.askdirectory(title="Select Measurement Database Folder")
-            if not chosen:
-                return
-            save_autoeq_db_path(chosen)
-            self._ensure_local_autoeq_index(chosen)
-            refresh_list()
-
-        search_var.trace_add("write", refresh_list)
-        listbox.bind("<Double-Button-1>", choose)
-        entry.bind("<Return>", lambda _e: choose() if filtered else None)
-        entry.bind("<Down>", lambda _e: (listbox.focus_set(), listbox.selection_set(0)))
-        dlg.bind("<Escape>", lambda _e: cancel())
-
-        row = ttk.Frame(dlg)
-        row.pack(fill="x", padx=12, pady=(6, 12))
-        ttk.Button(row, text="Browse File Instead...", command=browse_file).pack(
-            side="left")
-        ttk.Button(row, text="Change Database...", command=change_db).pack(
-            side="left", padx=(6, 0))
-        ttk.Button(row, text="Cancel", command=cancel).pack(side="right", padx=4)
-        select_btn = ttk.Button(row, text="Select", style="Accent.TButton", command=choose)
-        select_btn.pack(side="right", padx=4)
-
-        refresh_list()
-        # First result pre-selected so Enter works immediately.
-        if filtered:
-            listbox.selection_set(0)
-
-        dlg.protocol("WM_DELETE_WINDOW", cancel)
-        dlg.grab_set()
-        entry.focus_set()
-
-        dlg.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
-        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-
-        self.wait_window(dlg)
-        return result["path"], result["entry"]
-
-    # ------------------------------------------------------------------
-    # Device discovery
+    # Device
     # ------------------------------------------------------------------
 
     def _refresh_devices(self):
         self.device_list.delete(0, "end")
-        self._devices_cache = []
-
+        self.devices = []
+        self.selected_path = None  # the old pick may be unplugged by now
         if hid is None:
-            self._log("hidapi not available; cannot list devices.\n")
+            self.log("hidapi not available; cannot list devices.\n")
             return
 
-        found = [d for d in hid.enumerate() if d["vendor_id"] == WALKPLAY_VENDOR_ID]
-        if not found:
+        self.devices = find_devices()
+        if not self.devices:
             self.device_list.insert("end", "(no Walkplay-vendor devices found)")
-
-        for d in found:
+        for d in self.devices:
             self.device_list.insert(
-                "end",
-                f"pid=0x{d['product_id']:04X} iface={d.get('interface_number')}  "
-                f"{d.get('product_string')}")
-            self._devices_cache.append(d)
+                "end", f"pid=0x{d['product_id']:04X} iface={d.get('interface_number')}  "
+                       f"{d.get('product_string')}")
 
     def _on_device_select(self, _event):
         sel = self.device_list.curselection()
-        if not sel or not self._devices_cache:
+        if not sel or sel[0] >= len(self.devices):
             return
-        idx = sel[0]
-        if idx >= len(self._devices_cache):
-            return
-
-        d = self._devices_cache[idx]
+        d = self.devices[sel[0]]
         self.selected_path = d["path"]
-
         self.vid_entry.delete(0, "end")
         self.vid_entry.insert(0, f"0x{d['vendor_id']:04X}")
         self.pid_entry.delete(0, "end")
         self.pid_entry.insert(0, f"0x{d['product_id']:04X}")
 
-    # ------------------------------------------------------------------
-    # Tooltips
-    # ------------------------------------------------------------------
+    def _with_device(self, action, on_done=None):
+        """Run action(dev) in the background on the selected device; errors go to the log."""
+        vid = parse_int(self.vid_entry.get(), WALKPLAY_VENDOR_ID)
+        pid = parse_int(self.pid_entry.get())
+        path = self.selected_path
 
-    def _add_tooltip(self, widget, text):
-        """Show a small hover tooltip (used for keyboard-shortcut hints)."""
-        state = {"win": None}
+        def work():
+            with device_session(vid, pid, path) as dev:
+                return action(dev)
 
-        def show(_e=None):
-            if state["win"] is not None or not text:
-                return
-            x = widget.winfo_rootx() + 10
-            y = widget.winfo_rooty() + widget.winfo_height() + 4
-            win = tk.Toplevel(self)
-            win.wm_overrideredirect(True)
-            win.wm_geometry(f"+{x}+{y}")
-            tk.Label(win, text=text, bg=THEME["input"], fg=THEME["ink"],
-                     font=(self.font_ui, 9), padx=6, pady=2,
-                     highlightthickness=1, highlightbackground=THEME["line"]).pack()
-            state["win"] = win
+        self.run_task(work, on_done)
 
-        def hide(_e=None):
-            if state["win"] is not None:
-                state["win"].destroy()
-                state["win"] = None
+    def _get_slot(self):
+        self._with_device(get_current_slot)
 
-        widget.bind("<Enter>", show, add="+")
-        widget.bind("<Leave>", hide, add="+")
-        widget.bind("<Destroy>", hide, add="+")
+    def _enable(self):
+        slot = parse_int(self.ed_slot_spin.get(), 0)
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+        def enable(dev):
+            enable_peq(dev, True, slot_id=slot)
+            print(f"PEQ enabled on slot {slot}")
 
-    def _on_close(self):
-        dlg = tk.Toplevel(self)
-        dlg.title("Quit")
-        dlg.configure(bg=THEME["chassis"])
-        dlg.transient(self)
-        dlg.resizable(False, False)
+        self._with_device(enable)
 
-        ttk.Label(dlg, text="Do you really want to leave this application?").pack(
-            padx=24, pady=(20, 16))
+    def _disable(self):
+        def disable(dev):
+            enable_peq(dev, False)
+            print("PEQ disabled")
 
-        row = ttk.Frame(dlg)
-        row.pack(padx=16, pady=(0, 18))
+        self._with_device(disable)
 
-        def choose(action):
-            dlg.destroy()
-            if action == "quit":
-                self.destroy()
-            elif action == "push":
-                self._create_push(then=self.destroy)
-            elif action == "save":
-                self._create_save_profile(then=self.destroy)
-            # "cancel" just closes the dialog
+    def _load_from_device(self):
+        if not messagebox.askyesno(
+                "Load EQ from Device",
+                "Load EQ from device? This will replace all current filters."):
+            return
+        max_filters = self.max_filters()
+        self._with_device(
+            lambda dev: pull_from_device(dev, max_filters, slot_hint=get_current_slot(dev)),
+            lambda result: self.set_filters(result["filters"], result["globalGain"]))
 
-        quit_btn = ttk.Button(row, text="Quit", style="Danger.TButton",
-                              command=lambda: choose("quit"))
-        quit_btn.pack(side="left", padx=4)
-        ttk.Button(row, text="Cancel",
-                   command=lambda: choose("cancel")).pack(side="left", padx=4)
-        ttk.Button(row, text="Push to device and quit",
-                   command=lambda: choose("push")).pack(side="left", padx=4)
-        ttk.Button(row, text="Save to file and quit",
-                   command=lambda: choose("save")).pack(side="left", padx=4)
+    def _push(self, then=None):
+        """Push the EQ; `then()` runs only after a successful push."""
+        if not self.filters:
+            messagebox.showwarning("No Filters", "Add at least one EQ band first.")
+            return
 
-        # Enter = Quit, Escape = Cancel.
-        dlg.bind("<Return>", lambda _e: choose("quit"))
-        dlg.bind("<KP_Enter>", lambda _e: choose("quit"))
-        dlg.bind("<Escape>", lambda _e: choose("cancel"))
+        slot = parse_int(self.slot_spin.get(), 0)
+        preamp = parse_float(self.preamp_spin.get(), 0)
+        buffer_db = parse_float(self.buffer_spin.get(), DEFAULT_GLOBAL_GAIN_BUFFER)
+        max_filters = self.max_filters()
 
-        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)  # dialog's own X = cancel
-        dlg.grab_set()
-        dlg.update_idletasks()
-        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
-        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
-        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
-        quit_btn.focus_set()
+        if len(self.filters) > max_filters and ask_choice(
+                self, "Too Many Bands",
+                f"You have {len(self.filters)} EQ bands, but the device is set to "
+                f"support only {max_filters} filter slot(s) (see 'Max filters').\n\n"
+                f"Only the first {max_filters} band(s) would be written to the "
+                f"device — the rest would be silently dropped.\n\n"
+                f"Reduce your EQ to {max_filters} band(s), correct 'Max filters' to "
+                f"match your device, or push anyway (will break your EQ).",
+                [("Cancel", None, "TButton"),
+                 ("Push Anyway", "push", "Danger.TButton")],
+                wraplength=420, focus="Cancel") != "push":
+            return
+
+        filters = pad_for_push(self.filters, max_filters)
+
+        def push(dev):
+            push_to_device(dev, slot, preamp, filters, buffer_db=buffer_db)
+            enable_peq(dev, True, slot_id=slot)
+            print(f"EQ pushed to device on slot {slot} ({len(filters)} slots)")
+
+        self._with_device(push, then and (lambda _result: then()))
 
     # ------------------------------------------------------------------
-    # Logging
+    # Background tasks, log, lifecycle
     # ------------------------------------------------------------------
 
-    def _log(self, text):
-        self.log_queue.put(text)
+    def run_task(self, work, on_done=None, *, busy=None, error=None, on_error=None):
+        """Run work() on a worker thread, then on_done(result) on the Tk thread.
 
-    def _poll_log_queue(self):
-        while True:
-            try:
-                text = self.log_queue.get_nowait()
-            except queue.Empty:
-                break
-            self.log_text.configure(state="normal")
-            self.log_text.insert("end", text)
-            self.log_text.see("end")
-            self.log_text.configure(state="disabled")
-        self.after(100, self._poll_log_queue)
+        busy: (title, message) of a modal spinner shown meanwhile.
+        error: (title, message) of an error box on failure; failures are
+        always logged. on_error(): called (on the Tk thread) after a failure.
+        """
+        dlg = busy_dialog(self, *busy) if busy else None
 
-    # ------------------------------------------------------------------
-    # Parsing helpers
-    # ------------------------------------------------------------------
+        def finish(callback, *args):
+            if dlg is not None:
+                dlg.destroy()
+            if callback is not None:
+                callback(*args)
 
-    @staticmethod
-    def _parse_int(s, default=None):
-        s = (s or "").strip()
-        if not s:
-            return default
-        try:
-            return int(s, 0)
-        except ValueError:
-            return default
+        def failed(exc):
+            self.log(f"\nERROR: {exc}\n")
+            if error:
+                messagebox.showerror(error[0], f"{error[1]}:\n{exc}")
+            if on_error is not None:
+                on_error()
 
-    @staticmethod
-    def _parse_float(s, default=None):
-        s = (s or "").strip().replace(",", ".")
-        if not s:
-            return default
-        try:
-            return float(s)
-        except ValueError:
-            return default
-
-    # ------------------------------------------------------------------
-    # Device helpers / background tasks
-    # ------------------------------------------------------------------
-
-    def _open_selected_device(self):
-        if hid is None:
-            raise RuntimeError("hidapi not installed (pip install hidapi)")
-        vid = self._parse_int(self.vid_entry.get(), WALKPLAY_VENDOR_ID)
-        pid = self._parse_int(self.pid_entry.get(), None)
-        return open_device(vid=vid, pid=pid, path=self.selected_path)
-
-    def _run_bg(self, fn):
         def target():
-            old_stdout, old_stderr = sys.stdout, sys.stderr
-            sys.stdout = sys.stderr = StdoutRedirector(self.log_queue)
             try:
-                fn()
-            except Exception as e:
-                self._log(f"\nERROR: {e}\n")
-            finally:
-                sys.stdout, sys.stderr = old_stdout, old_stderr
+                result = work()
+            except Exception as exc:
+                self._ui_calls.put((finish, failed, exc))
+            else:
+                self._ui_calls.put((finish, on_done, result))
 
         threading.Thread(target=target, daemon=True).start()
 
-    def _get_slot(self):
-        def task():
-            dev = self._open_selected_device()
-            try:
-                get_current_slot(dev)
-            finally:
-                dev.close()
+    def log(self, text):
+        self.log_queue.put(text)
 
-        self._run_bg(task)
+    def _poll_queues(self):
+        texts = []
+        while not self.log_queue.empty():
+            texts.append(self.log_queue.get_nowait())
+        if texts:
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", "".join(texts))
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+        while not self._ui_calls.empty():
+            func, *args = self._ui_calls.get_nowait()
+            func(*args)
+        self._poll_after_id = self.after(50, self._poll_queues)
 
-    def _enable(self):
-        slot = self._parse_int(self.ed_slot_spin.get(), 0)
-
-        def task():
-            dev = self._open_selected_device()
-            try:
-                enable_peq(dev, True, slot_id=slot)
-                print(f"PEQ enabled on slot {slot}")
-            finally:
-                dev.close()
-
-        self._run_bg(task)
-
-    def _disable(self):
-        def task():
-            dev = self._open_selected_device()
-            try:
-                enable_peq(dev, False)
-                print("PEQ disabled")
-            finally:
-                dev.close()
-
-        self._run_bg(task)
+    def _on_close(self):
+        choice = ask_choice(
+            self, "Quit", "Do you really want to leave this application?",
+            [("Quit", "quit", "Danger.TButton"),
+             ("Cancel", None, "TButton"),
+             ("Push to device and quit", "push", "TButton"),
+             ("Save to file and quit", "save", "TButton")],
+            enter="quit", focus="Quit")
+        if choice == "quit":
+            self.destroy()
+        elif choice == "push":
+            self._push(then=self.destroy)
+        elif choice == "save":
+            self._save_profile(then=self.destroy)
 
 
 # ===========================================================================
@@ -3212,48 +2663,30 @@ class EqLoaderGUI(tk.Tk):
 # ===========================================================================
 
 def _cli_push(args):
-    vid = int(args.vid, 0) if args.vid else WALKPLAY_VENDOR_ID
-    pid = int(args.pid, 0) if args.pid else None
-
     profile = load_profile(args.file)
-    filters = [
-        f for f in profile["filters"]
-        if not f.get("disabled", is_filter_disabled(
-            f.get("type", "PK"), f["freq"], f["gain"], f["q"]))
-    ]
-
-    dev = open_device(vid=vid, pid=pid)
-    try:
-        push_to_device(dev, slot=args.slot, global_gain=profile["preamp"],
-                       filters=filters, buffer_db=args.buffer,
-                       write_gain=not args.no_gain)
+    filters = [f for f in profile["filters"] if not filter_is_off(f)]
+    if len(filters) > args.max_filters:
+        print(f"Warning: {len(filters)} bands but only {args.max_filters} filter "
+              f"slots; the device will drop the extra bands.")
+    with device_session(args.vid, args.pid) as dev:
+        push_to_device(dev, args.slot, profile["preamp"],
+                       pad_for_push(filters, args.max_filters),
+                       buffer_db=args.buffer, write_gain=not args.no_gain)
         if not args.no_enable:
             enable_peq(dev, True, slot_id=args.slot)
             print(f"PEQ enabled on slot {args.slot}")
-    finally:
-        dev.close()
 
 
 def _cli_pull(args):
-    vid = int(args.vid, 0) if args.vid else WALKPLAY_VENDOR_ID
-    pid = int(args.pid, 0) if args.pid else None
-
-    dev = open_device(vid=vid, pid=pid)
-    try:
-        slot = get_current_slot(dev)
-        result = pull_from_device(dev, max_filters=args.max_filters, slot_hint=slot)
-        save_profile(args.file, result["globalGain"], result["filters"])
-        print(f"Saved {len(result['filters'])} filter(s) to {args.file}")
-    finally:
-        dev.close()
-
-
-def _cli_list(_args):
-    list_devices()
+    with device_session(args.vid, args.pid) as dev:
+        result = pull_from_device(dev, args.max_filters, slot_hint=get_current_slot(dev))
+    save_profile(args.file, result["globalGain"], result["filters"])
+    print(f"Saved {len(result['filters'])} filter(s) to {args.file}")
 
 
 def _build_parser():
-    import argparse
+    def hex_int(text):
+        return int(text, 0)
 
     p = argparse.ArgumentParser(
         prog="eqloader",
@@ -3269,6 +2702,15 @@ def _build_parser():
 
     sub = p.add_subparsers(dest="cmd")
 
+    def add_device_args(parser):
+        parser.add_argument("--max-filters", type=int, default=DEFAULT_MAX_FILTERS,
+                            help=f"Number of filter slots on the device "
+                                 f"(default: {DEFAULT_MAX_FILTERS})")
+        parser.add_argument("--vid", type=hex_int, default=None,
+                            help="Device VID in hex (default: 0x3302)")
+        parser.add_argument("--pid", type=hex_int, default=None,
+                            help="Device PID in hex (optional)")
+
     pp = sub.add_parser("push", help="Push a .txt profile to the device")
     pp.add_argument("file", help="Profile .txt file to push")
     pp.add_argument("--slot", type=int, default=0, help="Target PEQ slot (default: 0)")
@@ -3278,30 +2720,27 @@ def _build_parser():
                     help="Skip writing the global gain register")
     pp.add_argument("--no-enable", action="store_true",
                     help="Don't enable PEQ after pushing")
-    pp.add_argument("--vid", default=None, help="Device VID in hex (default: 0x3302)")
-    pp.add_argument("--pid", default=None, help="Device PID in hex (optional)")
+    add_device_args(pp)
 
     pu = sub.add_parser("pull", help="Pull the current EQ from the device to a .txt file")
     pu.add_argument("file", help="Output .txt file")
-    pu.add_argument("--max-filters", type=int, default=DEFAULT_MAX_FILTERS,
-                    help=f"Number of filter slots to read (default: {DEFAULT_MAX_FILTERS})")
-    pu.add_argument("--vid", default=None, help="Device VID in hex (default: 0x3302)")
-    pu.add_argument("--pid", default=None, help="Device PID in hex (optional)")
+    add_device_args(pu)
 
     sub.add_parser("list", help="List connected Walkplay HID devices")
-
     return p
 
 
-if __name__ == "__main__":
-    args = _build_parser().parse_args()
-
+def main(argv=None):
+    args = _build_parser().parse_args(argv)
     if args.cmd == "push":
         _cli_push(args)
     elif args.cmd == "pull":
         _cli_pull(args)
     elif args.cmd == "list":
-        _cli_list(args)
+        list_devices()
     else:
-        app = EqLoaderGUI(graph=args.graph)
-        app.mainloop()
+        EqLoaderGUI(graph=args.graph).mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -60,7 +60,7 @@ The frequency-response graph is shown by default and hides automatically when th
 2. The first time, choose **Download Online Database** to fetch the public [AutoEq](https://github.com/jaakkopasanen/AutoEq) measurement database from GitHub, or **Choose Local Folder...** to point at your own folder of measurement `.txt`/`.csv` files. This choice is remembered for next time.
 3. In the search popup, type your headphone or IEM model name and pick the right entry (multiple measurement sources per model are labeled by their subfolder, e.g. `oratory1990` vs `Crinacle`). Online entries download on selection and are cached locally, so picking the same model again is instant. Use **Browse File Instead...** for a one-off local file, or **Change Database...** to switch source.
 4. Pick a target curve: flat (0 dB), search AutoEQ's own online target library (Harman, diffuse-field, and more — fetched and cached the same way as measurements), or load your own target curve file.
-5. The optimizer runs in the background (a progress dialog shows while it works — this can take up to a minute) and fills in the filter bands plus a clip-safe preamp automatically. Review and tweak as usual, then push.
+5. The optimizer runs in the background (a progress dialog shows while it works — typically a few seconds) and fills in the filter bands plus a clip-safe preamp automatically. Review and tweak as usual, then push.
 
 **Skip the optimizer — load an already-computed profile:** click **Load Pre-computed Profile...** (Ctrl+Shift+L) instead, pick a model from the online database the same way, and it fetches the matching `ParametricEQ.txt` the AutoEQ project already generated (via its own pipeline against a Harman-style target) rather than running AutoEQ locally. If a model has more than one variant (different target presets), you'll get to pick which one. Only available for models picked from the online database, not a local folder/file.
 
@@ -136,9 +136,10 @@ Loads a `.txt` profile and writes it to the device.
 | Option | Default | Description |
 |---|---|---|
 | `--slot N` | `0` | PEQ slot to write to |
-| `--buffer DB` | `0.0` | Hardware gain buffer in dB |
+| `--buffer DB` | `-5` | Hardware gain buffer in dB |
 | `--no-gain` | — | Skip writing the preamp gain |
 | `--no-enable` | — | Don't enable PEQ after pushing |
+| `--max-filters N` | `8` | Device filter slots; unused ones are padded with inert bands |
 | `--vid HEX` | `0x3302` | Override vendor ID |
 | `--pid HEX` | auto | Target a specific product ID |
 
