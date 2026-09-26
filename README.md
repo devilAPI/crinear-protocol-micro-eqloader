@@ -25,12 +25,12 @@ Python 3 with `tkinter`. On Linux, raw HID access needs a udev rule for the devi
 ## Usage
 
 ```
-python3 eqloader.py [--graph-no-hide | --no-graph]
+python3 eqloader.py [--force-graph | --no-graph]
 ```
 
 Plug in the dongle and click **Refresh List** (F5); it appears in the Device list. Select it to use it for all device actions. With several Walkplay devices, pick the right one or enter its PID.
 
-The graph hides automatically when the window gets too short to use it. `--graph-no-hide` keeps it visible, `--no-graph` always hides it.
+The graph hides automatically when the window gets too short to use it. `--force-graph` keeps it visible, `--no-graph` always hides it.
 
 ### Building an EQ
 

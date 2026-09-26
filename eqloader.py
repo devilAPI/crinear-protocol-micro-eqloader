@@ -2717,8 +2717,10 @@ def _build_parser():
 
     graph_grp = p.add_mutually_exclusive_group()
     graph_grp.add_argument(
-        "--graph-no-hide", dest="graph", action="store_true", default=None,
-        help="Always show the frequency-response graph (GUI only)")
+        "--force-graph", dest="graph", action="store_true", default=None,
+        help="Always show the frequency-response graph, even in a small window (GUI only)")
+    graph_grp.add_argument(  # old name of --force-graph, kept for existing scripts
+        "--graph-no-hide", dest="graph", action="store_true", help=argparse.SUPPRESS)
     graph_grp.add_argument(
         "--no-graph", dest="graph", action="store_false",
         help="Always hide the frequency-response graph (GUI only)")
