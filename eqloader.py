@@ -270,6 +270,28 @@ def is_filter_disabled(ftype, freq, gain, q):
     return not (freq or q or gain)
 
 
+def dedupe_filters(filters):
+    """Drop exact-duplicate bands, keeping first occurrence.
+
+    The device always stores a fixed number of slots (typically 8); pushing
+    fewer bands leaves it padding the tail by repeating the last band(s), so a
+    pulled profile can contain identical copies. Two bands with the same type,
+    frequency, gain and Q are audibly one band, so we keep only the first.
+    """
+    seen = set()
+    result = []
+    for f in filters:
+        key = (f.get("type", "PK"),
+               round(float(f["freq"]), 2),
+               round(float(f["gain"]), 2),
+               round(float(f["q"]), 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(f)
+    return result
+
+
 def parse_filter_packet(packet):
     freq = packet[27] | (packet[28] << 8)
     q_raw = packet[29] | (packet[30] << 8)
@@ -649,6 +671,12 @@ class EqLoaderGUI(tk.Tk):
         self.pid_entry = ttk.Entry(override_frame, width=10)
         self.pid_entry.grid(row=0, column=3, padx=4)
 
+        ttk.Label(override_frame, text="Max filters:").grid(
+            row=0, column=4, sticky="w", padx=(12, 0))
+        self.max_filter_entry = ttk.Entry(override_frame, width=6)
+        self.max_filter_entry.insert(0, str(DEFAULT_MAX_FILTERS))
+        self.max_filter_entry.grid(row=0, column=5, padx=4)
+
         # ---- Graph (row 2, col 0) ----
         self.fig = Figure(figsize=(7, 4), dpi=100,
                           facecolor=THEME["chassis"], layout="constrained")
@@ -1026,18 +1054,20 @@ class EqLoaderGUI(tk.Tk):
                 "Load EQ from device? This will replace all current filters."):
             return
 
+        max_filters = self._parse_int(self.max_filter_entry.get(), DEFAULT_MAX_FILTERS)
+
         def task():
             dev = self._open_selected_device()
             try:
                 slot = get_current_slot(dev)
                 result = pull_from_device(
-                    dev, max_filters=DEFAULT_MAX_FILTERS, slot_hint=slot)
+                    dev, max_filters=max_filters, slot_hint=slot)
             finally:
                 dev.close()
 
             def apply():
                 self._snapshot()
-                self.create_filters = [
+                loaded = [
                     {
                         "type": f.get("type", "PK"),
                         "freq": float(f["freq"]) or 1000.0,
@@ -1047,6 +1077,7 @@ class EqLoaderGUI(tk.Tk):
                     for f in result["filters"]
                     if not f.get("disabled", False)
                 ]
+                self.create_filters = dedupe_filters(loaded)
                 self.selected_filter = 0 if self.create_filters else -1
                 self.create_preamp_entry.delete(0, "end")
                 self.create_preamp_entry.insert(0, str(result["globalGain"]))
@@ -1305,7 +1336,14 @@ class EqLoaderGUI(tk.Tk):
         preamp = self._parse_float(self.create_preamp_entry.get(), 0)
         buffer_db = self._parse_float(
             self.create_buffer_entry.get(), DEFAULT_GLOBAL_GAIN_BUFFER)
+        max_filters = self._parse_int(self.max_filter_entry.get(), DEFAULT_MAX_FILTERS)
+
+        # Pad with inert (gain-0) dummy bands up to the device's slot count, so
+        # the device doesn't backfill the unused tail slots with copies of the
+        # last real band.
         filters = [dict(f) for f in self.create_filters]
+        while len(filters) < max_filters:
+            filters.append(dict(INERT_FILTER))
 
         def task():
             dev = self._open_selected_device()
@@ -1313,7 +1351,8 @@ class EqLoaderGUI(tk.Tk):
                 push_to_device(dev, slot=slot, global_gain=preamp, filters=filters,
                                buffer_db=buffer_db, write_gain=True)
                 enable_peq(dev, True, slot_id=slot)
-                print(f"Created EQ pushed to device on slot {slot}")
+                print(f"Created EQ pushed to device on slot {slot} "
+                      f"({len(filters)} slots)")
             finally:
                 dev.close()
 
@@ -1350,7 +1389,7 @@ class EqLoaderGUI(tk.Tk):
             return
 
         self._snapshot()
-        self.create_filters = [
+        loaded = [
             {
                 "type": f.get("type", "PK"),
                 "freq": float(f["freq"]) or 1000.0,
@@ -1361,6 +1400,7 @@ class EqLoaderGUI(tk.Tk):
             if not f.get("disabled", is_filter_disabled(
                 f.get("type", "PK"), f["freq"], f["gain"], f["q"]))
         ]
+        self.create_filters = dedupe_filters(loaded)
         self.selected_filter = 0 if self.create_filters else -1
 
         self.create_preamp_entry.delete(0, "end")

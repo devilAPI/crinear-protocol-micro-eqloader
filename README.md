@@ -61,6 +61,15 @@ The frequency-response graph is shown by default and hides automatically when th
 1. Click **Load from Device** — the current EQ is pulled and shown in the editor.
 2. Click **Save Profile** to write it to a `.txt` file you can keep or share.
 
+### Max filters
+
+The **Max filters** field in the Device row (default `8`) is the number of PEQ slots your device stores.
+
+- **On push:** if your EQ has fewer bands than this, the remaining slots are padded with inert (0 dB) dummy bands so the device doesn't backfill them with copies of your last band.
+- **On load:** exact-duplicate bands (which the device creates when padding its unused slots) are collapsed to a single band.
+
+Set this to match your device's actual slot count if it isn't 8.
+
 ### Enabling / disabling the EQ
 
 **Note:** this is note suported on evey device
