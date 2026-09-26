@@ -1393,6 +1393,55 @@ class EqLoaderGUI(tk.Tk):
             self.create_buffer_entry.get(), DEFAULT_GLOBAL_GAIN_BUFFER)
         max_filters = self._parse_int(self.max_filter_entry.get(), DEFAULT_MAX_FILTERS)
 
+        if len(self.create_filters) > max_filters:
+            self._confirm_filter_overflow(slot, preamp, buffer_db, max_filters, then=then)
+            return
+
+        self._do_push(slot, preamp, buffer_db, max_filters, then=then)
+
+    def _confirm_filter_overflow(self, slot, preamp, buffer_db, max_filters, then=None):
+        dlg = tk.Toplevel(self)
+        dlg.title("Too Many Bands")
+        dlg.configure(bg=THEME["chassis"])
+        dlg.transient(self)
+        dlg.resizable(False, False)
+
+        msg = (
+            f"You have {len(self.create_filters)} EQ bands, but the device is "
+            f"set to support only {max_filters} filter slot(s) (see 'Max filters').\n\n"
+            f"Writing more bands than your hardware supports will only write the "
+            f"first {max_filters} band(s) to the device — the rest will be silently "
+            f"dropped.\n\n"
+            f"Reduce your EQ to {max_filters} band(s), correct 'Max filters' to "
+            f"match your device, or push anyway (will break your EQ). Filters with 0 gain are ignored and will not be written to the device."
+        )
+        ttk.Label(dlg, text=msg, wraplength=420, justify="left").pack(
+            padx=24, pady=(20, 16))
+
+        row = ttk.Frame(dlg)
+        row.pack(padx=16, pady=(0, 18))
+
+        def choose(action):
+            dlg.destroy()
+            if action == "push":
+                self._do_push(slot, preamp, buffer_db, max_filters, then=then)
+            # "cancel" just closes the dialog
+
+        cancel_btn = ttk.Button(row, text="Cancel", command=lambda: choose("cancel"))
+        cancel_btn.pack(side="left", padx=4)
+        ttk.Button(row, text="Push Anyway", style="Danger.TButton",
+                   command=lambda: choose("push")).pack(side="left", padx=4)
+
+        dlg.bind("<Escape>", lambda _e: choose("cancel"))
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.grab_set()
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        cancel_btn.focus_set()
+
+    def _do_push(self, slot, preamp, buffer_db, max_filters, then=None):
         # Pad with inert (gain-0) dummy bands up to the device's slot count, so
         # the device doesn't backfill the unused tail slots with copies of the
         # last real band.
