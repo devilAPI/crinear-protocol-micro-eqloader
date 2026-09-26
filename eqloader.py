@@ -86,6 +86,8 @@ BYTE_TO_FILTER_TYPE = {v: k for k, v in FILTER_TYPE_TO_BYTE.items()}
 
 DEFAULT_GLOBAL_GAIN_BUFFER = -5
 DEFAULT_MAX_FILTERS = 8
+# Rate the device's biquad coefficients are designed at (see compute_iir_filter).
+DEVICE_SAMPLE_RATE = 96000
 
 
 def list_devices():
@@ -170,7 +172,7 @@ def quantizer(d_arr, d_arr2):
 
 def compute_iir_filter(freq, gain, q):
     sqrt = math.sqrt(10 ** (gain / 20))
-    d3 = (freq * 6.283185307179586) / 96000
+    d3 = (freq * 6.283185307179586) / DEVICE_SAMPLE_RATE
     sin = math.sin(d3) / (2 * q)
     d4 = sin * sqrt
     d5 = sin / sqrt
@@ -446,7 +448,10 @@ def save_profile(path, global_gain, filters):
 # ===========================================================================
 
 AUTOEQ_CONFIG = {
-    "default_sample_rate": 48000,
+    # hangout.audio uses a generic 48 kHz; model the filters exactly as the
+    # device will run them instead, since response near the top of the band
+    # differs noticeably between the two rates.
+    "default_sample_rate": DEVICE_SAMPLE_RATE,
     "treble_start_from": 7000,
     "autoeq_range": (20, 15000),
     "optimize_q_range": (0.5, 2),
@@ -485,6 +490,9 @@ def parse_frequency_response_file(path):
                 freq = float(parts[0])
                 gain = float(parts[1])
             except ValueError:
+                continue
+            # A single NaN would poison every distance the optimizer computes.
+            if not (math.isfinite(freq) and math.isfinite(gain)) or freq <= 0:
                 continue
             points.append((freq, gain))
 
@@ -817,7 +825,10 @@ def autoeq_apply(fr, filters, sample_rate=None):
 
 
 def autoeq_calc_preamp(fr1, fr2):
-    return -max(v2 - v1 for (_, v1), (_, v2) in zip(fr1, fr2))
+    """Attenuation (<= 0 dB, floored to 0.1 dB) that keeps the EQ's peak boost
+    from clipping. Never positive: an all-cut EQ must not add gain."""
+    max_boost = max(v2 - v1 for (_, v1), (_, v2) in zip(fr1, fr2))
+    return min(0.0, math.floor(-max_boost * 10) / 10)
 
 
 def autoeq_calc_distance(fr1, fr2):
@@ -866,21 +877,22 @@ def autoeq_search_candidates(fr, fr_target, threshold):
         if next_state == state:
             continue
 
-        if start_index >= 0:
-            if state != 0:
-                start = fr[start_index][0]
-                end = f
-                center = math.sqrt(start * end)
-                gain = (
-                    autoeq_interp([center], fr_target[start_index:i + 1])[0][1] -
-                    autoeq_interp([center], fr[start_index:i + 1])[0][1]
-                )
-                q = center / (end - start)
-                if min_freq <= center <= max_freq:
-                    candidates.append({"type": "PK", "freq": center, "q": q, "gain": gain})
-            start_index = -1
-        else:
-            start_index = i
+        # Close the peak/dip region that just ended. Upstream toggled
+        # start_index on every state change instead, which falls out of step
+        # after a direct peak<->dip jump and then drops every later region.
+        # (A region still open at the top of the grid is dropped, as upstream.)
+        if state != 0 and start_index >= 0:
+            start = fr[start_index][0]
+            end = f
+            center = math.sqrt(start * end)
+            gain = (
+                autoeq_interp([center], fr_target[start_index:i + 1])[0][1] -
+                autoeq_interp([center], fr[start_index:i + 1])[0][1]
+            )
+            q = center / (end - start)
+            if min_freq <= center <= max_freq:
+                candidates.append({"type": "PK", "freq": center, "q": q, "gain": gain})
+        start_index = i if next_state != 0 else -1
         state = next_state
 
     return candidates
@@ -970,6 +982,8 @@ def autoeq_run(fr, fr_target, max_filters):
 
     `fr` / `fr_target`: list of (freq, dB) on the same, ascending frequency grid.
     """
+    if max_filters <= 0:
+        return []
     deltas = AUTOEQ_CONFIG["optimize_deltas"]
     first_batch_size = max(math.floor(max_filters / 2) - 1, 1)
 
@@ -1003,21 +1017,19 @@ def autoeq_run(fr, fr_target, max_filters):
 
 
 # ---------------------------------------------------------------------------
-# ISO 226:2003 equal-loudness normalization (port of hangout.audio's
-# graphtool.js normalizePhone()/find_offset()/init_normalize()).
+# ISO 226:2003 equal-loudness normalization (port of CrinGraph's graphtool.js
+# find_offset()/init_normalize(), which hangout.audio's graphs are built on).
 #
-# hangout.audio (Crinacle's AutoEQ tool, a CrinGraph fork) doesn't feed raw
-# measurement/target dB values straight into Equalizer.autoeq() the way the
-# plain autoeq.app tool does — it first computes, independently for each
-# curve, the dB offset that brings it to a fixed equal-loudness reference
-# (0 phon by default), and adds that offset before running the optimizer.
-# Skipping this step is a real source of divergence from hangout.audio's
-# output: without it, two curves that each use a different absolute dB
-# reference convention (as different measurement sources/rigs do) get
-# compared directly, which can make the optimizer chase a systematic level
-# offset instead of the actual shape difference. Applying it here makes the
-# AutoEQ pipeline reference-convention-agnostic, matching the site's logic.
+# Equalizer.autoeq() expects its two curves to be level-aligned already: the
+# optimizer only has peaking filters, so it can't correct a constant offset
+# between measurement and target and would waste bands chasing one. Different
+# measurement sources/rigs use arbitrary absolute dB references, so each
+# curve is independently shifted to the same loudness first. 60 phon is
+# CrinGraph's (and hangout.audio's) default graph normalization; the exact
+# level barely changes the result, it just has to be the same for both.
 # ---------------------------------------------------------------------------
+
+AUTOEQ_NORMALIZE_PHON = 60.0
 
 _ISO226_F = [
     20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160,
@@ -1149,8 +1161,8 @@ def iso226_find_offset(curve, target_phon=0.0):
 
 
 def autoeq_loudness_normalize(curve):
-    """Shift `curve` by its own ISO-226 offset to 0 phon, matching hangout.audio."""
-    offset = iso226_find_offset(curve, 0.0)
+    """Shift `curve` by its own ISO-226 offset to AUTOEQ_NORMALIZE_PHON."""
+    offset = iso226_find_offset(curve, AUTOEQ_NORMALIZE_PHON)
     return [(f, v + offset) for f, v in curve]
 
 
@@ -1648,7 +1660,7 @@ class EqLoaderGUI(tk.Tk):
                 f"Q {f['q']:.2f}  {f['type']}")
 
     @staticmethod
-    def _biquad_response_db(freqs, freq0, gain_db, q, ftype, fs=96000):
+    def _biquad_response_db(freqs, freq0, gain_db, q, ftype, fs=DEVICE_SAMPLE_RATE):
         q = max(q, 0.001)
         w0 = 2 * np.pi * freq0 / fs
         A = 10 ** (gain_db / 40)
@@ -2672,11 +2684,11 @@ class EqLoaderGUI(tk.Tk):
                     [(f, 0.0) for f in freqs] if target_points is None
                     else autoeq_interp(freqs, target_points))
 
-                # Loudness-normalize both curves before comparing them (matches
-                # hangout.audio's pipeline): otherwise two curves that each use
-                # a different absolute dB reference convention — as different
-                # measurement sources/rigs do — get compared directly, and the
-                # optimizer chases a systematic level offset instead of shape.
+                # Loudness-normalize both curves before comparing them:
+                # otherwise two curves that each use a different absolute dB
+                # reference convention — as different measurement sources/rigs
+                # do — get compared directly, and the optimizer chases a
+                # systematic level offset instead of shape.
                 fr = autoeq_loudness_normalize(fr)
                 fr_target = autoeq_loudness_normalize(fr_target)
 
