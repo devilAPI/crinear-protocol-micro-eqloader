@@ -1069,6 +1069,11 @@ class EqLoaderGUI(tk.Tk):
 
     def _build_widgets(self):
 
+        self.grid_rowconfigure(2, weight=3)
+        self.grid_rowconfigure(3, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=0)
+
         # --------------------------------------------------------------
         # Device
         # --------------------------------------------------------------
@@ -1078,8 +1083,11 @@ class EqLoaderGUI(tk.Tk):
             text="Device"
         )
 
-        dev_frame.pack(
-            fill="x",
+        dev_frame.grid(
+            row=0,
+            column=0,
+            columnspan=2,
+            sticky="ew",
             padx=8,
             pady=6
         )
@@ -1133,9 +1141,13 @@ class EqLoaderGUI(tk.Tk):
 
         override_frame = ttk.Frame(self)
 
-        override_frame.pack(
-            fill="x",
-            padx=8
+        override_frame.grid(
+            row=1,
+            column=0,
+            columnspan=2,
+            sticky="ew",
+            padx=8,
+            pady=2
         )
 
         ttk.Label(
@@ -1188,11 +1200,13 @@ class EqLoaderGUI(tk.Tk):
         # --------------------------------------------------------------
 
         nb = ttk.Notebook(self)
+        self.nb = nb
 
-        nb.pack(
-            fill="both",
-            expand=True,
-            padx=8,
+        nb.grid(
+            row=2,
+            column=0,
+            sticky="nsew",
+            padx=(8, 4),
             pady=6
         )
 
@@ -1212,6 +1226,7 @@ class EqLoaderGUI(tk.Tk):
         # --------------------------------------------------------------
 
         eq_notebook = ttk.Notebook(eq_tab)
+        self.eq_notebook = eq_notebook
 
         eq_notebook.pack(
             fill="both",
@@ -1496,13 +1511,17 @@ class EqLoaderGUI(tk.Tk):
             master=create_tab
         )
 
+        create_tab.rowconfigure(0, weight=1)
+        create_tab.columnconfigure(0, weight=1)
+
         # Connect the click and drag events
         self.canvas_graph.mpl_connect("button_press_event", self._on_press)
         self.canvas_graph.mpl_connect("motion_notify_event", self._on_motion)
         self.canvas_graph.mpl_connect("button_release_event", self._on_release)
-        self.canvas_graph.get_tk_widget().pack(
-            fill="both",
-            expand=True,
+        self.canvas_graph.get_tk_widget().grid(
+            row=0,
+            column=0,
+            sticky="nsew",
             padx=5,
             pady=5
         )
@@ -1513,11 +1532,15 @@ class EqLoaderGUI(tk.Tk):
 
         ctrl = ttk.Frame(create_tab)
 
-        ctrl.pack(
-            fill="x",
+        ctrl.grid(
+            row=1,
+            column=0,
+            sticky="nsew",
             padx=6,
             pady=6
         )
+
+        ctrl.columnconfigure(1, weight=1)
 
         # Filter list
 
@@ -1526,18 +1549,20 @@ class EqLoaderGUI(tk.Tk):
             text="Filters"
         )
 
-        list_frame.pack(
-            side="left",
-            fill="y"
+        list_frame.grid(
+            row=0,
+            column=0,
+            sticky="ns"
         )
 
         self.filter_list = tk.Listbox(
             list_frame,
             height=9,
-            width=32
         )
 
         self.filter_list.pack(
+            fill="both",
+            expand=True,
             padx=5,
             pady=5
         )
@@ -1554,12 +1579,14 @@ class EqLoaderGUI(tk.Tk):
             text="Selected Filter"
         )
 
-        edit.pack(
-            side="left",
-            fill="x",
-            expand=True,
+        edit.grid(
+            row=0,
+            column=1,
+            sticky="nsew",
             padx=10
         )
+
+        edit.columnconfigure(1, weight=1)
 
         ttk.Label(
             edit,
@@ -1579,11 +1606,10 @@ class EqLoaderGUI(tk.Tk):
         ttk.Entry(
             edit,
             textvariable=self.freq_var,
-            width=12
         ).grid(
             row=0,
             column=1,
-            sticky="w",
+            sticky="ew",
             padx=5,
             pady=4
         )
@@ -1606,11 +1632,10 @@ class EqLoaderGUI(tk.Tk):
         ttk.Entry(
             edit,
             textvariable=self.gain_var,
-            width=12
         ).grid(
             row=1,
             column=1,
-            sticky="w",
+            sticky="ew",
             padx=5,
             pady=4
         )
@@ -1635,11 +1660,10 @@ class EqLoaderGUI(tk.Tk):
         ttk.Entry(
             edit,
             textvariable=self.q_var,
-            width=12
         ).grid(
             row=2,
             column=1,
-            sticky="w",
+            sticky="ew",
             padx=5,
             pady=4
         )
@@ -1669,12 +1693,11 @@ class EqLoaderGUI(tk.Tk):
                 "LP",
                 "HP",
             ],
-            width=10,
             state="readonly"
         ).grid(
             row=3,
             column=1,
-            sticky="w",
+            sticky="ew",
             padx=5,
             pady=4
         )
@@ -1695,68 +1718,6 @@ class EqLoaderGUI(tk.Tk):
             pady=2,
         )
 
-        # --------------------------------------------------------------
-        # Editor buttons
-        # --------------------------------------------------------------
-
-        button_frame = ttk.Frame(edit)
-
-        button_frame.grid(
-            row=5,
-            column=0,
-            columnspan=3,
-            sticky="w",
-            padx=5,
-            pady=8
-        )
-
-        ttk.Button(
-            button_frame,
-            text="Apply",
-            command=self._create_apply,
-            style="Accent.TButton"
-        ).pack(
-            side="left",
-            padx=2
-        )
-
-        ttk.Button(
-            button_frame,
-            text="Add Band",
-            command=self._create_add_band
-        ).pack(
-            side="left",
-            padx=2
-        )
-
-        ttk.Button(
-            button_frame,
-            text="Delete Band",
-            command=self._create_delete_band,
-            style="Danger.TButton"
-        ).pack(
-            side="left",
-            padx=2
-        )
-
-        ttk.Button(
-            button_frame,
-            text="Delete All",
-            command=self._create_delete_all_bands,
-            style="Danger.TButton"
-        ).pack(
-            side="left",
-            padx=2
-        )
-
-        ttk.Button(
-            button_frame,
-            text="Load from Device",
-            command=self._create_load_from_device
-        ).pack(
-            side="left",
-            padx=2
-        )
 
         # --------------------------------------------------------------
         # Created EQ push controls
@@ -1767,8 +1728,10 @@ class EqLoaderGUI(tk.Tk):
             text="Created EQ"
         )
 
-        push_created_frame.pack(
-            fill="x",
+        push_created_frame.grid(
+            row=2,
+            column=0,
+            sticky="ew",
             padx=6,
             pady=6
         )
@@ -1844,36 +1807,6 @@ class EqLoaderGUI(tk.Tk):
             padx=4
         )
 
-        ttk.Button(
-            push_created_frame,
-            text="Push Created EQ",
-            command=self._create_push,
-            style="Accent.TButton"
-        ).pack(
-            side="left",
-            padx=12,
-            pady=6
-        )
-
-        ttk.Button(
-            push_created_frame,
-            text="Save Profile...",
-            command=self._create_save_profile,
-        ).pack(
-            side="left",
-            padx=4,
-            pady=6,
-        )
-
-        ttk.Button(
-            push_created_frame,
-            text="Load Profile...",
-            command=self._create_load_profile,
-        ).pack(
-            side="left",
-            padx=4,
-            pady=6,
-        )
 
         # --------------------------------------------------------------
         # Enable / Disable
@@ -1946,16 +1879,17 @@ class EqLoaderGUI(tk.Tk):
             text="Log"
         )
 
-        log_frame.pack(
-            fill="both",
-            expand=False,
-            padx=8,
+        log_frame.grid(
+            row=3,
+            column=0,
+            sticky="nsew",
+            padx=(8, 4),
             pady=6
         )
 
         self.log_text = scrolledtext.ScrolledText(
             log_frame,
-            height=9,
+            height=5,
             state="disabled"
         )
 
@@ -1967,6 +1901,50 @@ class EqLoaderGUI(tk.Tk):
         )
 
         # --------------------------------------------------------------
+        # Actions panel — main window column 1, spans notebook + log
+        # --------------------------------------------------------------
+
+        actions = ttk.LabelFrame(self, text="Actions")
+        self.actions = actions
+
+        actions.grid(
+            row=2,
+            column=1,
+            rowspan=2,
+            sticky="nsew",
+            padx=(0, 8),
+            pady=6,
+        )
+
+        actions.columnconfigure(0, weight=1)
+
+        _action_btns = (
+            ("Apply",            self._create_apply,            "Accent.TButton"),
+            ("Add Band",         self._create_add_band,         "TButton"),
+            ("Delete Band",      self._create_delete_band,      "Danger.TButton"),
+            ("Delete All",       self._create_delete_all_bands, "Danger.TButton"),
+            ("Load from Device", self._create_load_from_device, "TButton"),
+            ("Save Profile",     self._create_save_profile,     "TButton"),
+            ("Load Profile",     self._create_load_profile,     "TButton"),
+            ("Push Created EQ",  self._create_push,             "Accent.TButton"),
+        )
+
+        for i, (text, cmd, style) in enumerate(_action_btns):
+            actions.rowconfigure(i, weight=1)
+            ttk.Button(
+                actions,
+                text=text,
+                command=cmd,
+                style=style,
+            ).grid(
+                row=i,
+                column=0,
+                sticky="nsew",
+                padx=6,
+                pady=2,
+            )
+
+        # --------------------------------------------------------------
         # Initial state
         # --------------------------------------------------------------
 
@@ -1974,9 +1952,30 @@ class EqLoaderGUI(tk.Tk):
         self.bind("<Control-y>", self._redo)
         self.bind("<Control-Shift-z>", self._redo)
 
+        nb.bind("<<NotebookTabChanged>>", self._on_tab_change)
+        eq_notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
+
         self._refresh_create_tab()
 
         self._refresh_devices()
+
+        self._on_tab_change()
+
+    # ==================================================================
+    # Tab visibility
+    # ==================================================================
+
+    def _on_tab_change(self, _event=None):
+        try:
+            on_eq_tab = self.nb.index(self.nb.select()) == 0
+            on_editor = self.eq_notebook.index(self.eq_notebook.select()) == 1
+        except Exception:
+            on_eq_tab = on_editor = False
+
+        if on_eq_tab and on_editor:
+            self.actions.grid()
+        else:
+            self.actions.grid_remove()
 
     # ==================================================================
     # Create / Editor
