@@ -677,8 +677,11 @@ class EqLoaderGUI(tk.Tk):
 
         ttk.Label(override_frame, text="Max filters:").grid(
             row=0, column=4, sticky="w", padx=(12, 0))
-        self.max_filter_entry = ttk.Entry(override_frame, width=6)
-        self.max_filter_entry.insert(0, str(DEFAULT_MAX_FILTERS))
+        int_only = (self.register(lambda s: s == "" or s.isdigit()), "%P")
+        self.max_filter_entry = ttk.Spinbox(
+            override_frame, from_=1, to=64, increment=1, width=6,
+            validate="key", validatecommand=int_only)
+        self.max_filter_entry.set(DEFAULT_MAX_FILTERS)
         self.max_filter_entry.grid(row=0, column=5, padx=4)
 
         # ---- Graph (row 2, col 0) ----
@@ -719,17 +722,18 @@ class EqLoaderGUI(tk.Tk):
         edit.grid(row=0, column=1, sticky="nsew", padx=10)
         edit.columnconfigure(1, weight=1)
 
-        for row_i, (lbl, var_name, default) in enumerate((
-            ("Frequency (Hz)", "freq_var", "1000"),
-            ("Gain (dB)", "gain_var", "0"),
-            ("Q", "q_var", "1.0"),
+        for row_i, (lbl, var_name, default, lo, hi, step, fmt) in enumerate((
+            ("Frequency (Hz)", "freq_var", "1000", 10, 30000, 1, "%.0f"),
+            ("Gain (dB)", "gain_var", "0", -30, 30, 0.1, "%.1f"),
+            ("Q", "q_var", "1.0", 0.1, 100, 0.1, "%.1f"),
         )):
             lbl_widget = ttk.Label(edit, text=lbl)
             lbl_widget.grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
             if var_name == "q_var":
                 self.q_label = lbl_widget
             setattr(self, var_name, tk.StringVar(value=default))
-            ttk.Entry(edit, textvariable=getattr(self, var_name)).grid(
+            ttk.Spinbox(edit, textvariable=getattr(self, var_name),
+                        from_=lo, to=hi, increment=step, format=fmt).grid(
                 row=row_i, column=1, sticky="ew", padx=5, pady=3)
 
         ttk.Label(edit, text="Type").grid(row=3, column=0, sticky="w", padx=5, pady=3)
@@ -752,18 +756,18 @@ class EqLoaderGUI(tk.Tk):
         push_created_frame = ttk.LabelFrame(ops, text="EQ")
         push_created_frame.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=2)
         for lbl, attr, default in (
-            ("Slot", "create_slot_spin", None),
+            ("Slot", "create_slot_spin", "0"),
             ("Preamp (dB)", "create_preamp_entry", "0"),
             ("Buffer (dB)", "create_buffer_entry",
-             fmt_num(float(DEFAULT_GLOBAL_GAIN_BUFFER), 1)),
+             str(float(DEFAULT_GLOBAL_GAIN_BUFFER))),
         ):
             ttk.Label(push_created_frame, text=f"{lbl}:").pack(side="left", padx=(8, 2))
             if lbl == "Slot":
                 w = ttk.Spinbox(push_created_frame, from_=0, to=15, width=5)
-                w.set(0)
             else:
-                w = ttk.Entry(push_created_frame, width=7)
-                w.insert(0, default)
+                w = ttk.Spinbox(push_created_frame, from_=-30, to=30,
+                                increment=0.1, format="%.1f", width=7)
+            w.set(default)
             w.pack(side="left", padx=(0, 6))
             setattr(self, attr, w)
 
