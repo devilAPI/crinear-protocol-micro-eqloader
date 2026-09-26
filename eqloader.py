@@ -404,7 +404,7 @@ def pad_for_push(filters, max_filters):
 # ===========================================================================
 
 TXT_TYPE_TO_INTERNAL = {
-    "LS": "LSQ", "LSC": "LSQ", "HS": "HSQ", "HSC": "HSQ",
+    "LS": "LSQ", "LSC": "LSQ", "LSQ": "LSQ", "HS": "HSQ", "HSC": "HSQ", "HSQ": "HSQ",
     "PK": "PK", "LP": "LP", "HP": "HP",
 }
 INTERNAL_TYPE_TO_TXT = {"LSQ": "LS", "HSQ": "HS", "PK": "PK", "LP": "LP", "HP": "HP"}

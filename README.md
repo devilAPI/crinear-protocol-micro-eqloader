@@ -1,22 +1,18 @@
 # walkplay-eqloader
 
-A standalone desktop tool for pushing and editing parametric EQ profiles on Walkplay-based USB DAC dongles (e.g. Crinear Protocol Micro) — no internet connection or proprietary app required.
+A desktop tool for editing parametric EQ and pushing it to Walkplay-based USB DAC dongles (e.g. the Crinear Protocol Micro) without the vendor's app. It also generates EQ from headphone measurements with AutoEQ.
 
-![Screenshot](screenshots/screenshot.png)
+![Main window](screenshots/main.png)
 
 ## Features
 
-- **Visual EQ editor** — drag band handles directly on the frequency response graph to tune frequency and gain interactively. Click empty space to add a new band; right-click a handle to delete it. The graph spans 20 Hz – 20 kHz with readable Hz/kHz axis labels.
-- **AutoEQ** — search a headphone/IEM model by name (from the online [AutoEq](https://github.com/jaakkopasanen/AutoEq) database or a local folder of measurements) and automatically generate parametric EQ bands plus a clip-safe preamp to correct it towards a flat, AutoEQ-library, or custom target.
-- **Load Pre-computed Profile** — skip running the optimizer yourself: fetch a `ParametricEQ.txt` the AutoEQ project has already computed for a model, straight from its GitHub `results/` folder.
-- **5 filter types** — Peaking (PK), Low Shelf (LSQ), High Shelf (HSQ), Low Pass (LP), High Pass (HP).
-- **Q / Bandwidth toggle** — switch the Q field to octave bandwidth and back without losing precision.
-- **Push to device** — write the current EQ to any PEQ slot with a configurable preamp level and hardware gain buffer. Warns (with a "push anyway" option) if you have more bands than the device supports, since the extras would otherwise be silently dropped.
-- **Load from device** — read the current EQ back from the dongle into the editor.
-- **Save / load profiles** — read and write the standard `.txt` format used by eq.hangout.audio and EqualizerAPO, so existing community profiles work out of the box.
-- **OFF-band handling** — `OFF` bands and peaking/shelf filters with zero gain are automatically skipped when loading, matching the device's own behaviour.
-- **Enable / disable PEQ** — toggle the hardware EQ on or off per slot without touching the stored profile.
-- **Undo / redo** — full history for all editor changes (Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z).
+- **Visual EQ editor**: click the graph to add a band, drag a handle to move it, right-click to delete it. Values can also be typed in, and several selected bands can be edited at once.
+- **Filter types**: Peaking (PK), Low Shelf (LSQ), High Shelf (HSQ), Low Pass (LP), High Pass (HP). Q can be shown as bandwidth in octaves.
+- **Device**: push the EQ to any PEQ slot, load the current EQ back from the device, and enable/disable PEQ per slot.
+- **Profiles**: save and load the `.txt` format used by EqualizerAPO and eq.hangout.audio.
+- **AutoEQ**: pick a headphone/IEM model from the [AutoEq](https://github.com/jaakkopasanen/AutoEq) database and generate EQ bands plus a clip-safe preamp, or load the profile the AutoEq project already computed for it.
+- **Undo/redo** for all editor changes.
+- **CLI** for pushing and pulling profiles from scripts.
 
 ## Requirements
 
@@ -24,75 +20,60 @@ A standalone desktop tool for pushing and editing parametric EQ profiles on Walk
 pip install hidapi matplotlib numpy
 ```
 
-Standard library modules (`tkinter`, `math`, `threading`, etc.) are included with Python 3.
-
-On Linux you may need udev rules or to run as root for raw HID access:
-
-```
-sudo python3 eqloader.py
-```
+Python 3 with `tkinter`. On Linux, raw HID access needs a udev rule for the device, or running as root (`sudo python3 eqloader.py`). The AutoEQ database is fetched from GitHub, so AutoEQ needs an internet connection; everything else works offline.
 
 ## Usage
-
-### Starting up
 
 ```
 python3 eqloader.py [--graph-no-hide | --no-graph]
 ```
 
-Plug in your dongle, then click **Refresh List** — it will appear in the Device list at the top. Select it to target it for all push/pull operations. If you have multiple Walkplay devices, pick the right one or set the PID field manually.
+Plug in the dongle and click **Refresh List** (F5); it appears in the Device list. Select it to use it for all device actions. With several Walkplay devices, pick the right one or enter its PID.
 
-The frequency-response graph is shown by default and hides automatically when the window is too short to use it precisely. Pass `--graph-no-hide` to keep it visible at all times, or `--no-graph` to always hide it (useful in small or tiling windows).
+The graph hides automatically when the window gets too short to use it. `--graph-no-hide` keeps it visible, `--no-graph` always hides it.
 
-### Building an EQ from scratch
+### Building an EQ
 
-1. Click anywhere on the graph to place a new band at that frequency and gain.
-2. Drag the band handle to adjust it, or type exact values in the **Selected Filter** panel on the left. Edits apply live — the graph updates as you type, no reload needed.
-3. Choose a filter type from the **Type** dropdown (PK, LSQ, HSQ, LP, HP). Q becomes less relevant for shelves and is hidden from the graph but still editable.
-4. Add as many bands as the device supports (default: 8). Use **Delete Band** or right-click a handle on the graph to remove one.
-5. Set **Slot**, **Preamp**, and **Buffer** in the Created EQ row, then click **Push Created EQ** in the Actions panel.
+1. Click the graph to place a band, then drag it, or type exact values in the **Selected Filter** panel. Changes apply immediately.
+2. Pick the filter type in **Type**.
+3. To edit several bands at once, Ctrl-/Shift-click them in the **Filters** list; a changed field applies to all selected bands.
+4. Set **Slot**, **Preamp** and **Buffer** in the **EQ** row and click **Push EQ to Device**.
 
-**Editing multiple bands at once:** Ctrl-click or Shift-click in the **Filters** list to select several bands. Changing a field in the **Selected Filter** panel applies that field to every selected band, and **Delete Band** removes them all.
+### Preamp and buffer
 
-### AutoEQ — generate an EQ from your headphone model
-
-1. Click **AutoEQ** (Ctrl+Shift+A).
-2. The first time, choose **Download Online Database** to fetch the public [AutoEq](https://github.com/jaakkopasanen/AutoEq) measurement database from GitHub, or **Choose Local Folder...** to point at your own folder of measurement `.txt`/`.csv` files. This choice is remembered for next time.
-3. In the search popup, type your headphone or IEM model name and pick the right entry (multiple measurement sources per model are labeled by their subfolder, e.g. `oratory1990` vs `Crinacle`). Online entries download on selection and are cached locally, so picking the same model again is instant. Use **Browse File Instead...** for a one-off local file, or **Change Database...** to switch source.
-4. Pick a target curve: flat (0 dB), search AutoEQ's own online target library (Harman, diffuse-field, and more — fetched and cached the same way as measurements), or load your own target curve file.
-5. The optimizer runs in the background (a progress dialog shows while it works — typically a few seconds) and fills in the filter bands plus a clip-safe preamp automatically. Review and tweak as usual, then push.
-
-**Skip the optimizer — load an already-computed profile:** click **Load Pre-computed Profile...** (Ctrl+Shift+L) instead, pick a model from the online database the same way, and it fetches the matching `ParametricEQ.txt` the AutoEQ project already generated (via its own pipeline against a Harman-style target) rather than running AutoEQ locally. If a model has more than one variant (different target presets), you'll get to pick which one. Only available for models picked from the online database, not a local folder/file.
-
-### Loading an existing profile
-
-1. Click **Load Profile** in the Actions panel and select a `.txt` file.
-2. The bands load into the editor — disabled (`OFF`) and inert bands are filtered out automatically.
-3. Review the curve on the graph, tweak if needed, then push.
-
-### Backing up what's on the device
-
-1. Click **Load from Device** — the current EQ is pulled and shown in the editor.
-2. Click **Save Profile** to write it to a `.txt` file you can keep or share.
+The Protocol Micro always attenuates its output by a fixed 5 dB, set as **Buffer** (default `-5`). The device only stores the preamp beyond that, in whole dB: a preamp of −4.4 dB needs no extra attenuation, −9.6 dB is stored as 5 dB extra. **Load EQ from Device** reports the resulting preamp (stored value + buffer), so an exact preamp only survives through a saved profile file. If your device has no such buffer, set **Buffer** to `0`.
 
 ### Max filters
 
-The **Max filters** field in the Device row (default `8`) is the number of PEQ slots your device stores.
+**Max filters** (default `8`) is the number of PEQ bands the device stores. Pushes are padded with inert 0 dB bands, because otherwise the device fills unused slots with copies of the last band. If the EQ has more bands than this, you're warned first: the device would silently drop the extras.
 
-- **On push:** if your EQ has fewer bands than this, the remaining slots are padded with inert (0 dB) dummy bands so the device doesn't backfill them with copies of your last band. If it has *more* bands than this, pushing warns you first — only the first N bands would actually be written, with the rest silently dropped by the hardware — and lets you push anyway if that's what you want.
-- **On load:** exact-duplicate bands (which the device creates when padding its unused slots) are collapsed to a single band.
+### AutoEQ
 
-Set this to match your device's actual slot count if it isn't 8.
+1. Click **Compute AutoEQ** (Ctrl+Shift+A).
+2. The first time, choose **Download Online Database** (the AutoEq measurements on GitHub) or **Choose Local Folder...** with measurement `.txt`/`.csv` files. The choice is remembered.
+3. Search for your model and select it. The same model often has measurements from several sources, shown in brackets. Downloads are cached. **Browse File Instead...** uses a single local file, **Change Database...** switches the source.
+4. Pick a target: flat, a target from AutoEq's library (Harman, diffuse field, ...), or your own target file.
+5. The generated bands and preamp replace the current EQ. Review them, then push.
+
+![AutoEQ model search](screenshots/autoeq.png)
+
+> **Note:** Computing AutoEQ yourself is an experimental feature. It works, but results can differ from what autoeq.app or hangout.audio produce for the same measurement. For a well-tested result, use **Load Pre-computed AutoEQ** instead.
+
+**Load Pre-computed AutoEQ** (Ctrl+Shift+L) skips the optimizer: pick a model from the online database the same way, and it loads the `ParametricEQ.txt` the AutoEq project computed for that measurement. If there are several (one per target), you pick one. This only works for models from the online database.
+
+### Profiles and backups
+
+- **Load Profile from File** loads a `.txt` profile. OFF bands, zero-gain bands and duplicate bands are dropped.
+- **Save Profile to File** saves the current EQ and preamp.
+- To back up the device, use **Load EQ from Device**, then **Save Profile to File**.
 
 ### Enabling / disabling the EQ
 
-**Note:** this is note suported on evey device
-
-Use the **PEQ Enable / Disable** row to turn the hardware EQ on or off for a given slot without overwriting the stored profile. Useful for quick A/B comparisons.
+The **PEQ Enable / Disable** row switches the device EQ on or off for a slot without changing what's stored, e.g. for A/B comparisons. Not all devices support this.
 
 ### Keyboard shortcuts
 
-Every action has a keyboard shortcut (also shown on the buttons themselves):
+Shortcuts are also shown when hovering over a button.
 
 | Shortcut | Action |
 |---|---|
@@ -100,97 +81,71 @@ Every action has a keyboard shortcut (also shown on the buttons themselves):
 | Ctrl+Y / Ctrl+Shift+Z | Redo |
 | Ctrl+B | Add Band |
 | Ctrl+D | Delete Band |
-| Ctrl+Shift+D | Delete All Bands |
+| Ctrl+Shift+D | Delete All |
 | Ctrl+E | Load EQ from Device |
 | Ctrl+S | Save Profile to File |
 | Ctrl+O | Load Profile from File |
-| Ctrl+Shift+A | AutoEQ |
-| Ctrl+Shift+L | Load Pre-computed Profile |
+| Ctrl+Shift+A | Compute AutoEQ |
+| Ctrl+Shift+L | Load Pre-computed AutoEQ |
 | Ctrl+P | Push EQ to Device |
-| F5 | Refresh Device List |
+| F5 | Refresh List |
 | Ctrl+G | Get Slot / Version |
 | Ctrl+Shift+E | Enable PEQ |
 | Ctrl+Shift+X | Disable PEQ |
 
-## CLI & flags
+## CLI
 
-All GUI features are also available headlessly, useful for scripting or automation, or embedding EQ Profiles into your Desktop Environment.
+The CLI covers pushing, pulling and listing devices, e.g. for scripts or desktop shortcuts. Editing and AutoEQ are GUI-only.
 
-### GUI flags
-
-| Flag | Description |
-|---|---|
-| `--graph-no-hide` | Always show the frequency-response graph |
-| `--no-graph` | Always hide the frequency-response graph |
-
-Without either flag the graph is shown normally and hides automatically when the window becomes too small to interact with.
-
-### Push a profile to the device
+### Push a profile
 
 ```
 python3 eqloader.py push <file> [options]
 ```
 
-Loads a `.txt` profile and writes it to the device.
-
 | Option | Default | Description |
 |---|---|---|
 | `--slot N` | `0` | PEQ slot to write to |
-| `--buffer DB` | `-5` | Hardware gain buffer in dB |
-| `--no-gain` | — | Skip writing the preamp gain |
-| `--no-enable` | — | Don't enable PEQ after pushing |
+| `--buffer DB` | `-5` | Hardware gain buffer in dB (see [Preamp and buffer](#preamp-and-buffer)) |
 | `--max-filters N` | `8` | Device filter slots; unused ones are padded with inert bands |
-| `--vid HEX` | `0x3302` | Override vendor ID |
-| `--pid HEX` | auto | Target a specific product ID |
-
-Example:
+| `--no-gain` | | Don't write the preamp |
+| `--no-enable` | | Don't enable PEQ after pushing |
+| `--vid HEX` | `0x3302` | Vendor ID |
+| `--pid HEX` | first device found | Product ID |
 
 ```
-python3 eqloader.py push my_eq.txt --slot 1 --buffer 3.5
+python3 eqloader.py push my_eq.txt --slot 1
 ```
 
-### Pull the current EQ from the device
+### Pull the device EQ
 
 ```
 python3 eqloader.py pull <file> [options]
 ```
 
-Reads the active EQ from the dongle and saves it as a `.txt` profile, including the preamp (the device's gain register plus the hardware buffer — whole dB only, and never above the buffer, since that's all the device stores).
+Saves the device's current EQ and preamp as a `.txt` profile. Takes `--buffer`, `--max-filters`, `--vid` and `--pid` as above.
 
-| Option | Default | Description |
-|---|---|---|
-| `--max-filters N` | `8` | Maximum number of bands to read |
-| `--buffer DB` | `-5` | Hardware gain buffer in dB, added back to the device's gain register to get the saved preamp |
-| `--vid HEX` | `0x3302` | Override vendor ID |
-| `--pid HEX` | auto | Target a specific product ID |
-
-Example:
-
-```
-python3 eqloader.py pull backup.txt
-```
-
-### List connected devices
+### List devices
 
 ```
 python3 eqloader.py list
 ```
 
-Prints all connected Walkplay HID devices with their VID, PID, and serial number.
+Prints the connected Walkplay HID devices with VID, PID, interface, product name and HID path.
 
 ## Profile format
 
-Profiles follow the EqualizerAPO / eq.hangout.audio `.txt` convention:
+The EqualizerAPO / eq.hangout.audio `.txt` format. Decimal commas and points both work.
 
 ```
 Preamp: -6,0 dB
 Filter 1: ON PK Fc 1000,0 Hz Gain 3,5 dB Q 1,000
-Filter 2: ON LSQ Fc 80,0 Hz Gain -2,0 dB Q 0,707
+Filter 2: ON LS Fc 80,0 Hz Gain -2,0 dB Q 0,707
 Filter 3: OFF PK Fc 100,0 Hz Gain 0,0 dB Q 1,000
 ```
 
-`OFF` bands and peaking/shelf filters with zero gain are treated as disabled and are not pushed to the device.
+Filter types: `PK`, `LS`/`LSC`/`LSQ`, `HS`/`HSC`/`HSQ`, `LP`, `HP`. OFF bands and peaking/shelf bands with 0 dB gain are treated as disabled.
 
 ## Supported hardware
 
-Any Walkplay-vendor HID device (VID `0x3302`). Tested on the **Crinear Protocol Micro** (PID `0xC20F`). May work on other Walkplay dongles — open an issue if yours behaves differently.
+Walkplay-vendor HID devices (VID `0x3302`). Tested on the **Crinear Protocol Micro** (PID `0xC20F`). Other Walkplay dongles may work; please open an issue if yours behaves differently.
