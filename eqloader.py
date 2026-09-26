@@ -748,7 +748,7 @@ class EqLoaderGUI(tk.Tk):
             row=3, column=1, sticky="ew", padx=5, pady=3)
 
         self.bw_mode = tk.BooleanVar(value=False)
-        ttk.Checkbutton(edit, text="Show as Bandwidth (oct)", variable=self.bw_mode,
+        ttk.Checkbutton(edit, text="Show Q as Bandwidth (oct)", variable=self.bw_mode,
                         command=self._toggle_bw_mode).grid(
             row=4, column=0, columnspan=2, sticky="w", padx=5, pady=2)
 
