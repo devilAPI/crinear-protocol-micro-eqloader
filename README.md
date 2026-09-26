@@ -45,10 +45,12 @@ The frequency-response graph is shown by default and hides automatically when th
 ### Building an EQ from scratch
 
 1. Click anywhere on the graph to place a new band at that frequency and gain.
-2. Drag the band handle to adjust it, or type exact values in the **Selected Filter** panel on the left.
+2. Drag the band handle to adjust it, or type exact values in the **Selected Filter** panel on the left. Edits apply live — the graph updates as you type, no reload needed.
 3. Choose a filter type from the **Type** dropdown (PK, LSQ, HSQ, LP, HP). Q becomes less relevant for shelves and is hidden from the graph but still editable.
 4. Add as many bands as the device supports (default: 8). Use **Delete Band** or right-click a handle on the graph to remove one.
 5. Set **Slot**, **Preamp**, and **Buffer** in the Created EQ row, then click **Push Created EQ** in the Actions panel.
+
+**Editing multiple bands at once:** Ctrl-click or Shift-click in the **Filters** list to select several bands. Changing a field in the **Selected Filter** panel applies that field to every selected band, and **Delete Band** removes them all.
 
 ### Loading an existing profile
 
@@ -84,7 +86,6 @@ Every action has a keyboard shortcut (also shown on the buttons themselves):
 |---|---|
 | Ctrl+Z | Undo |
 | Ctrl+Y / Ctrl+Shift+Z | Redo |
-| Ctrl+R | Reload Graph |
 | Ctrl+B | Add Band |
 | Ctrl+D | Delete Band |
 | Ctrl+Shift+D | Delete All Bands |

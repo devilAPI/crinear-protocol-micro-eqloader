@@ -487,6 +487,10 @@ class EqLoaderGUI(tk.Tk):
         self._dragging_point_idx = None
         self._drag_snapshot_taken = False
 
+        # Live editor state.
+        self._loading_editor = False       # suppress traces while loading fields
+        self._editor_snapshot_taken = False  # one undo step per edit session
+
         self._build_widgets()
 
         if self._graph_forced is False:
@@ -707,7 +711,7 @@ class EqLoaderGUI(tk.Tk):
 
         list_frame = ttk.LabelFrame(ctrl, text="Filters")
         list_frame.grid(row=0, column=0, sticky="ns")
-        self.filter_list = tk.Listbox(list_frame, height=7)
+        self.filter_list = tk.Listbox(list_frame, height=7, selectmode="extended")
         self.filter_list.pack(fill="both", expand=True, padx=5, pady=5)
         self.filter_list.bind("<<ListboxSelect>>", self._create_select_band)
 
@@ -790,7 +794,6 @@ class EqLoaderGUI(tk.Tk):
         actions.columnconfigure(0, weight=1)
 
         action_btns = (
-            ("Reload Graph", self._create_apply, "Accent.TButton", "Ctrl+R", "<Control-r>"),
             ("Add Band", self._create_add_band, "TButton", "Ctrl+B", "<Control-b>"),
             ("Delete Band", self._create_delete_band, "Danger.TButton", "Ctrl+D", "<Control-d>"),
             ("Delete All", self._create_delete_all_bands, "Danger.TButton",
@@ -808,8 +811,6 @@ class EqLoaderGUI(tk.Tk):
             btn.grid(row=i, column=0, sticky="nsew", padx=6, pady=2)
             self.bind(seq, lambda _e, c=cmd: c())
             self._add_tooltip(btn, accel)
-            if text == "Reload Graph":
-                self._reload_graph_btn = btn
 
         # ---- Bindings + initial state ----
         self.bind("<Configure>", self._on_window_resize)
@@ -820,6 +821,12 @@ class EqLoaderGUI(tk.Tk):
         self.bind("<Control-g>", lambda _e: self._get_slot())
         self.bind("<Control-Shift-E>", lambda _e: self._enable())
         self.bind("<Control-Shift-X>", lambda _e: self._disable())
+
+        # Live-apply editor fields to the current selection as they change.
+        self.freq_var.trace_add("write", lambda *_: self._apply_field_to_selection("freq"))
+        self.gain_var.trace_add("write", lambda *_: self._apply_field_to_selection("gain"))
+        self.q_var.trace_add("write", lambda *_: self._apply_field_to_selection("q"))
+        self.type_var.trace_add("write", lambda *_: self._apply_field_to_selection("type"))
 
         self._refresh_create_tab()
         self._refresh_devices()
@@ -834,12 +841,10 @@ class EqLoaderGUI(tk.Tk):
             self._graph_too_small_label.pack_forget()
             if not canvas_widget.winfo_ismapped():
                 canvas_widget.pack(fill="both", expand=True)
-            self._reload_graph_btn.grid()
         else:
             canvas_widget.pack_forget()
             if self._graph_forced is None:
                 self._graph_too_small_label.pack(expand=True)
-            self._reload_graph_btn.grid_remove()
 
     def _check_initial_graph_visibility(self):
         self._layout_ready = True
@@ -873,12 +878,7 @@ class EqLoaderGUI(tk.Tk):
     # ------------------------------------------------------------------
 
     def _refresh_create_tab(self):
-        self.filter_list.delete(0, "end")
-        for i, f in enumerate(self.create_filters):
-            self.filter_list.insert(
-                "end",
-                f"{i + 1}: {f['freq']:.1f} Hz  {f['gain']:.1f} dB  "
-                f"Q {f['q']:.2f}  {f['type']}")
+        self._render_filter_rows()
 
         if self.create_filters:
             if self.selected_filter >= len(self.create_filters):
@@ -890,6 +890,15 @@ class EqLoaderGUI(tk.Tk):
             self.selected_filter = -1
 
         self._draw_response_graph()
+
+    def _render_filter_rows(self):
+        """Rebuild the listbox rows from create_filters (selection untouched)."""
+        self.filter_list.delete(0, "end")
+        for i, f in enumerate(self.create_filters):
+            self.filter_list.insert(
+                "end",
+                f"{i + 1}: {f['freq']:.1f} Hz  {f['gain']:.1f} dB  "
+                f"Q {f['q']:.2f}  {f['type']}")
 
     @staticmethod
     def _biquad_response_db(freqs, freq0, gain_db, q, ftype, fs=96000):
@@ -955,6 +964,9 @@ class EqLoaderGUI(tk.Tk):
         freqs = np.logspace(np.log10(20), np.log10(20000), 1000)
         response = np.zeros(len(freqs))
 
+        selected = set(self.filter_list.curselection())
+        selected.add(self.selected_filter)
+
         for index, f in enumerate(self.create_filters):
             try:
                 center_freq = float(f["freq"])
@@ -968,7 +980,7 @@ class EqLoaderGUI(tk.Tk):
             response += self._biquad_response_db(
                 freqs, center_freq, gain, q, f.get("type", "PK"))
 
-            is_selected = index == self.selected_filter
+            is_selected = index in selected
             color = c["active"] if is_selected else c["accent"]
 
             # Amber glow halo around the active band's handle.
@@ -1022,14 +1034,15 @@ class EqLoaderGUI(tk.Tk):
         sel = self.filter_list.curselection()
         if not sel:
             return
-        index = sel[0]
 
         self._snapshot()
-        del self.create_filters[index]
+        for index in sorted(sel, reverse=True):
+            del self.create_filters[index]
+
         if not self.create_filters:
             self.selected_filter = -1
         else:
-            self.selected_filter = min(index, len(self.create_filters) - 1)
+            self.selected_filter = min(sel[0], len(self.create_filters) - 1)
 
         self._refresh_create_tab()
         self._load_selected_filter_into_editor()
@@ -1096,63 +1109,69 @@ class EqLoaderGUI(tk.Tk):
         self._draw_response_graph()
 
     def _load_selected_filter_into_editor(self):
+        """Show the primary selected band's values (without re-applying them)."""
+        self._editor_snapshot_taken = False
         if not 0 <= self.selected_filter < len(self.create_filters):
             return
         f = self.create_filters[self.selected_filter]
 
-        self.freq_var.set(str(f["freq"]))
-        self.gain_var.set(str(f["gain"]))
-
-        if self.bw_mode.get():
-            q_val = max(float(f["q"]), 0.001)
-            bw = 2 * math.asinh(1 / (2 * q_val)) / math.log(2)
-            self.q_var.set(f"{bw:.3f}")
-        else:
-            self.q_var.set(str(f["q"]))
-
-        self.type_var.set(f["type"])
-
-    def _create_apply(self):
-        if not 0 <= self.selected_filter < len(self.create_filters):
-            return
-
+        self._loading_editor = True
         try:
-            freq = self._parse_float(self.freq_var.get())
-            gain = self._parse_float(self.gain_var.get())
-            q = self._parse_float(self.q_var.get())
-
-            if freq is None:
-                raise ValueError("Frequency is invalid.")
-            if gain is None:
-                raise ValueError("Gain is invalid.")
-            if q is None:
-                raise ValueError("Q is invalid.")
-
+            self.freq_var.set(str(f["freq"]))
+            self.gain_var.set(str(f["gain"]))
             if self.bw_mode.get():
-                if q <= 0:
-                    raise ValueError("Bandwidth must be greater than 0.")
-                try:
-                    q = 1 / (2 * math.sinh(q * math.log(2) / 2))
-                except OverflowError:
-                    raise ValueError("Bandwidth value is too large.")
+                q_val = max(float(f["q"]), 0.001)
+                bw = 2 * math.asinh(1 / (2 * q_val)) / math.log(2)
+                self.q_var.set(f"{bw:.3f}")
+            else:
+                self.q_var.set(str(f["q"]))
+            self.type_var.set(f["type"])
+        finally:
+            self._loading_editor = False
 
-            if freq <= 0:
-                raise ValueError("Frequency must be greater than 0.")
-            if q <= 0:
-                raise ValueError("Q must be greater than 0.")
-            if freq < 10 or freq > 30000:
-                raise ValueError("Frequency should be between 10 Hz and 30000 Hz.")
-        except ValueError as e:
-            messagebox.showerror("Invalid Filter", str(e))
+    def _apply_field_to_selection(self, field):
+        """Live-apply a single edited field to every selected band."""
+        if self._loading_editor:
+            return
+        sel = self.filter_list.curselection() or (
+            (self.selected_filter,) if 0 <= self.selected_filter < len(self.create_filters)
+            else ())
+        if not sel:
             return
 
-        self._snapshot()
-        f = self.create_filters[self.selected_filter]
-        f["freq"] = freq
-        f["gain"] = gain
-        f["q"] = q
-        f["type"] = self.type_var.get()
-        self._refresh_create_tab()
+        if field == "type":
+            value = self.type_var.get()
+        elif field == "gain":
+            value = self._parse_float(self.gain_var.get())
+            if value is None:
+                return
+        elif field == "freq":
+            value = self._parse_float(self.freq_var.get())
+            if value is None or value <= 0:
+                return
+        else:  # q (or bandwidth)
+            value = self._parse_float(self.q_var.get())
+            if value is None or value <= 0:
+                return
+            if self.bw_mode.get():
+                try:
+                    value = 1 / (2 * math.sinh(value * math.log(2) / 2))
+                except OverflowError:
+                    return
+                if value <= 0:
+                    return
+
+        if not self._editor_snapshot_taken:
+            self._snapshot()
+            self._editor_snapshot_taken = True
+
+        for i in sel:
+            self.create_filters[i][field] = value
+
+        self._render_filter_rows()
+        for i in sel:
+            self.filter_list.selection_set(i)
+        self._draw_response_graph()
 
     def _toggle_bw_mode(self):
         val = self._parse_float(self.q_var.get())
@@ -1161,18 +1180,24 @@ class EqLoaderGUI(tk.Tk):
                 text="Bandwidth (oct)" if self.bw_mode.get() else "Q")
             return
 
-        if self.bw_mode.get():
-            bw = 2 * math.asinh(1 / (2 * max(val, 0.001))) / math.log(2)
-            self.q_var.set(f"{bw:.3f}")
-            self.q_label.config(text="Bandwidth (oct)")
-        else:
-            try:
-                q = 1 / (2 * math.sinh(val * math.log(2) / 2))
-            except OverflowError:
+        # Only the display unit changes here, not the underlying band, so
+        # suppress the live-apply trace while rewriting the field.
+        self._loading_editor = True
+        try:
+            if self.bw_mode.get():
+                bw = 2 * math.asinh(1 / (2 * max(val, 0.001))) / math.log(2)
+                self.q_var.set(f"{bw:.3f}")
+                self.q_label.config(text="Bandwidth (oct)")
+            else:
+                try:
+                    q = 1 / (2 * math.sinh(val * math.log(2) / 2))
+                except OverflowError:
+                    self.q_label.config(text="Q")
+                    return
+                self.q_var.set(f"{q:.3f}")
                 self.q_label.config(text="Q")
-                return
-            self.q_var.set(f"{q:.3f}")
-            self.q_label.config(text="Q")
+        finally:
+            self._loading_editor = False
 
     # ------------------------------------------------------------------
     # Undo / redo
