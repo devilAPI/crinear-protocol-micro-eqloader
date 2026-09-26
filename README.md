@@ -1,4 +1,4 @@
-# crinear-protocol-micro-eqloader
+# walkplay-eqloader
 
 A standalone desktop tool for pushing and editing parametric EQ profiles on Walkplay-based USB DAC dongles (e.g. Crinear Protocol Micro) — no internet connection or proprietary app required.
 
