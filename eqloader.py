@@ -852,6 +852,9 @@ class EqLoaderGUI(tk.Tk):
 
         # None = auto (hide when <150 px), True = always show, False = always hide
         self._graph_forced = graph
+        self._graph_show_threshold = None  # window height at/above which the graph fits
+        self._layout_ready = False
+        self._resize_after_id = None
 
         self.title("Walkplay PEQ Loader")
 
@@ -888,6 +891,8 @@ class EqLoaderGUI(tk.Tk):
 
         if self._graph_forced is False:
             self._set_graph_visible(False)
+
+        self.after(150, self._check_initial_graph_visibility)
 
         self._theme_classic_widgets()
 
@@ -1468,7 +1473,7 @@ class EqLoaderGUI(tk.Tk):
         # Initial state
         # --------------------------------------------------------------
 
-        self.graph_frame.bind("<Configure>", self._on_graph_frame_resize)
+        self.bind("<Configure>", self._on_window_resize)
 
         self.bind("<Control-z>", self._undo)
         self.bind("<Control-y>", self._redo)
@@ -1495,10 +1500,31 @@ class EqLoaderGUI(tk.Tk):
                 self._graph_too_small_label.pack(expand=True)
             self._reload_graph_btn.grid_remove()
 
-    def _on_graph_frame_resize(self, event):
+    def _check_initial_graph_visibility(self):
+        self._layout_ready = True
+        self._apply_graph_visibility()
+
+    def _on_window_resize(self, event):
+        if not self._layout_ready or self._graph_forced is not None or event.widget is not self:
+            return
+        if self._resize_after_id is not None:
+            self.after_cancel(self._resize_after_id)
+        self._resize_after_id = self.after(80, self._apply_graph_visibility)
+
+    def _apply_graph_visibility(self):
+        self._resize_after_id = None
         if self._graph_forced is not None:
             return
-        self._set_graph_visible(event.height >= 150)
+        win_h = self.winfo_height()
+        if self.canvas_graph.get_tk_widget().winfo_ismapped():
+            # While visible, the chrome above/below the graph is stable, so the
+            # window height at which the frame would hit 150 px is a fixed value.
+            frame_h = self.graph_frame.winfo_height()
+            self._graph_show_threshold = win_h - frame_h + 150
+            if frame_h < 150:
+                self._set_graph_visible(False)
+        elif self._graph_show_threshold is None or win_h >= self._graph_show_threshold:
+            self._set_graph_visible(True)
 
     # ==================================================================
     # Create / Editor
