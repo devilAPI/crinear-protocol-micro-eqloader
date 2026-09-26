@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 
 import copy
+import json
 import math
+import os
 import queue
 import re
 import sys
 import threading
 import time
 import tkinter as tk
+import urllib.parse
+import urllib.request
+from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
@@ -434,6 +439,506 @@ def save_profile(path, global_gain, filters):
 
 
 # ===========================================================================
+# AutoEQ (port of the autoeq.app biquad.py / biquad-coeffs-cookbook logic)
+# ===========================================================================
+
+AUTOEQ_CONFIG = {
+    "default_sample_rate": 48000,
+    "treble_start_from": 7000,
+    "autoeq_range": (20, 15000),
+    "optimize_q_range": (0.5, 2),
+    "optimize_gain_range": (-12, 12),
+    "optimize_deltas": (
+        (10, 10, 10, 5, 0.1, 0.5),
+        (10, 10, 10, 2, 0.1, 0.2),
+        (10, 10, 10, 1, 0.1, 0.1),
+    ),
+}
+
+
+def autoeq_raw_frequencies():
+    """~1/96 octave grid from 20 Hz to 20 kHz, used for the optimizer itself."""
+    n = math.ceil(math.log(20000 / 20) / math.log(1.0072))
+    return [20 * (1.0072 ** i) for i in range(n)]
+
+
+def parse_frequency_response_file(path):
+    """Load a two-column (freq, gain) measurement/target text file.
+
+    Accepts whitespace- or comma-separated columns and ignores blank lines
+    and comment lines (starting with '#', '*' or ';'), which covers common
+    exports such as REW's frequency-response .txt files.
+    """
+    points = []
+    with open(path, "r") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith(("#", "*", ";")):
+                continue
+            parts = line.replace(",", " ").split()
+            if len(parts) < 2:
+                continue
+            try:
+                freq = float(parts[0])
+                gain = float(parts[1])
+            except ValueError:
+                continue
+            points.append((freq, gain))
+
+    if not points:
+        raise ValueError(f"No frequency/gain data found in {path}")
+    points.sort(key=lambda p: p[0])
+    return points
+
+
+# ---------------------------------------------------------------------------
+# AutoEQ model database (search-by-model, à la autoeq.app)
+# ---------------------------------------------------------------------------
+
+AUTOEQ_DB_CONFIG_PATH = os.path.expanduser("~/.config/eqloader/autoeq_db.json")
+AUTOEQ_LOCAL_CACHE_DIR = os.path.expanduser("~/.cache/eqloader/autoeq_db")
+
+# Public measurement database backing the autoeq.app website. Raw, per-model
+# measurements live under measurements/<source>/data/<category>/<model>.csv
+# as plain "frequency,raw" CSVs — much cleaner to index than results/, which
+# also holds generated EQ outputs, images and impulse-response .wav files.
+AUTOEQ_GITHUB_REPO = "jaakkopasanen/AutoEq"
+AUTOEQ_GITHUB_BRANCH = "master"
+AUTOEQ_GITHUB_API_BASE = f"https://api.github.com/repos/{AUTOEQ_GITHUB_REPO}"
+AUTOEQ_GITHUB_RAW_BASE = (
+    f"https://raw.githubusercontent.com/{AUTOEQ_GITHUB_REPO}/{AUTOEQ_GITHUB_BRANCH}/")
+AUTOEQ_MEASUREMENTS_DIR = "measurements"
+
+# Result files, not raw measurements — skip these when indexing a local folder
+# (a local clone may point at results/ instead of measurements/).
+_AUTOEQ_SKIP_SUFFIXES = ("parametriceq", "graphiceq", "fixedbandeq", " eq")
+
+
+def load_autoeq_db_path():
+    """Return the last-used measurement source ('online' or a folder path)."""
+    try:
+        with open(AUTOEQ_DB_CONFIG_PATH, "r") as fh:
+            path = json.load(fh).get("path")
+        if path == "online" or (path and os.path.isdir(path)):
+            return path
+    except Exception:
+        pass
+    return None
+
+
+def save_autoeq_db_path(path):
+    try:
+        os.makedirs(os.path.dirname(AUTOEQ_DB_CONFIG_PATH), exist_ok=True)
+        with open(AUTOEQ_DB_CONFIG_PATH, "w") as fh:
+            json.dump({"path": path}, fh)
+    except Exception:
+        pass
+
+
+def build_autoeq_model_index(root):
+    """Recursively index .txt measurement files under `root` by model name.
+
+    Works with a local clone of the AutoEQ 'results' database (or any folder
+    of raw frequency-response .txt files), so brand/model subfolders don't
+    matter — only the filename (as the model label) and its containing
+    folder (shown as a disambiguating subtitle) are used.
+    """
+    root = Path(root)
+    index = []
+    for path in root.rglob("*.txt"):
+        if path.stem.lower().endswith(_AUTOEQ_SKIP_SUFFIXES):
+            continue
+        index.append({
+            "label": path.stem,
+            "path": str(path),
+            "subtitle": str(path.relative_to(root).parent),
+            "remote": False,
+        })
+    index.sort(key=lambda e: e["label"].lower())
+    return index
+
+
+def _autoeq_github_get(url):
+    req = urllib.request.Request(
+        url, headers={"Accept": "application/vnd.github+json", "User-Agent": "eqloader"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return json.load(resp)
+
+
+def fetch_autoeq_online_index():
+    """Query the AutoEQ GitHub repo for its list of raw measurement files.
+
+    Only lists file names/paths (two small API calls); the actual
+    measurement content is downloaded lazily, on selection. Fetches just the
+    measurements/ subtree (by its own tree sha) rather than the whole repo's
+    recursive tree, since the latter is large enough to get truncated by
+    GitHub's API before reaching every model.
+    """
+    root = _autoeq_github_get(f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{AUTOEQ_GITHUB_BRANCH}")
+    meas_entry = next(
+        (e for e in root.get("tree", [])
+         if e.get("path") == AUTOEQ_MEASUREMENTS_DIR and e.get("type") == "tree"),
+        None)
+    if meas_entry is None:
+        raise RuntimeError(f"'{AUTOEQ_MEASUREMENTS_DIR}' folder not found in repo")
+
+    sub = _autoeq_github_get(
+        f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{meas_entry['sha']}?recursive=1")
+    if sub.get("truncated"):
+        print("Warning: GitHub file listing was truncated; some models may be missing.")
+
+    index = []
+    for entry in sub.get("tree", []):
+        path = entry.get("path", "")
+        if entry.get("type") != "blob" or "/data/" not in path or not path.endswith(".csv"):
+            continue
+        repo_path = f"{AUTOEQ_MEASUREMENTS_DIR}/{path}"
+        index.append({
+            "label": Path(path).stem,
+            "path": repo_path,  # repo-relative path; used as both remote key and cache key
+            "subtitle": str(Path(path).parent),
+            "remote": True,
+        })
+    index.sort(key=lambda e: e["label"].lower())
+    return index
+
+
+def fetch_autoeq_remote_file(repo_path):
+    """Download (and locally cache) one measurement file from the AutoEQ repo."""
+    cache_path = Path(AUTOEQ_LOCAL_CACHE_DIR) / repo_path
+    if cache_path.is_file():
+        return str(cache_path)
+
+    url = AUTOEQ_GITHUB_RAW_BASE + urllib.parse.quote(repo_path)
+    req = urllib.request.Request(url, headers={"User-Agent": "eqloader"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        content = resp.read()
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_bytes(content)
+    return str(cache_path)
+
+
+def autoeq_interp(fv, fr):
+    """Interpolate values at fv (ascending) from breakpoints fr (ascending).
+
+    Ported as-is from the JS `interp`: the scan index is shared across the
+    whole fv pass rather than reset per point, which relies on both fv and
+    fr being sorted ascending.
+    """
+    i = 0
+    n = len(fr)
+    out = []
+    for f in fv:
+        found = False
+        while i < n - 1:
+            f0, v0 = fr[i]
+            f1, v1 = fr[i + 1]
+            if i == 0 and f < f0:
+                out.append((f, v0))
+                found = True
+                break
+            elif f0 <= f < f1:
+                v = v0 + (v1 - v0) * (f - f0) / (f1 - f0)
+                out.append((f, v))
+                found = True
+                break
+            else:
+                i += 1
+        if not found:
+            out.append((f, fr[-1][1]))
+    return out
+
+
+def _autoeq_lowshelf(freq, q, gain, sample_rate=None):
+    sample_rate = sample_rate or AUTOEQ_CONFIG["default_sample_rate"]
+    freq = max(1e-6, min(freq / sample_rate, 1))
+    q = max(1e-4, min(q, 1000))
+    gain = max(-40, min(gain, 40))
+
+    w0 = 2 * math.pi * freq
+    sin, cos = math.sin(w0), math.cos(w0)
+    a = 10 ** (gain / 40)
+    alpha = sin / (2 * q)
+    alphamod = 2 * math.sqrt(a) * alpha
+
+    a0 = (a + 1) + (a - 1) * cos + alphamod
+    a1 = -2 * ((a - 1) + (a + 1) * cos)
+    a2 = (a + 1) + (a - 1) * cos - alphamod
+    b0 = a * ((a + 1) - (a - 1) * cos + alphamod)
+    b1 = 2 * a * ((a - 1) - (a + 1) * cos)
+    b2 = a * ((a + 1) - (a - 1) * cos - alphamod)
+    return (1.0, a1 / a0, a2 / a0, b0 / a0, b1 / a0, b2 / a0)
+
+
+def _autoeq_highshelf(freq, q, gain, sample_rate=None):
+    sample_rate = sample_rate or AUTOEQ_CONFIG["default_sample_rate"]
+    freq = max(1e-6, min(freq / sample_rate, 1))
+    q = max(1e-4, min(q, 1000))
+    gain = max(-40, min(gain, 40))
+
+    w0 = 2 * math.pi * freq
+    sin, cos = math.sin(w0), math.cos(w0)
+    a = 10 ** (gain / 40)
+    alpha = sin / (2 * q)
+    alphamod = 2 * math.sqrt(a) * alpha
+
+    a0 = (a + 1) - (a - 1) * cos + alphamod
+    a1 = 2 * ((a - 1) - (a + 1) * cos)
+    a2 = (a + 1) - (a - 1) * cos - alphamod
+    b0 = a * ((a + 1) + (a - 1) * cos + alphamod)
+    b1 = -2 * a * ((a - 1) + (a + 1) * cos)
+    b2 = a * ((a + 1) + (a - 1) * cos - alphamod)
+    return (1.0, a1 / a0, a2 / a0, b0 / a0, b1 / a0, b2 / a0)
+
+
+def _autoeq_peaking(freq, q, gain, sample_rate=None):
+    sample_rate = sample_rate or AUTOEQ_CONFIG["default_sample_rate"]
+    freq = max(1e-6, min(freq / sample_rate, 1))
+    q = max(1e-4, min(q, 1000))
+    gain = max(-40, min(gain, 40))
+
+    w0 = 2 * math.pi * freq
+    sin, cos = math.sin(w0), math.cos(w0)
+    a = 10 ** (gain / 40)
+    alpha = sin / (2 * q)
+
+    a0 = 1 + alpha / a
+    a1 = -2 * cos
+    a2 = 1 - alpha / a
+    b0 = 1 + alpha * a
+    b1 = -2 * cos
+    b2 = 1 - alpha * a
+    return (1.0, a1 / a0, a2 / a0, b0 / a0, b1 / a0, b2 / a0)
+
+
+def autoeq_filters_to_coeffs(filters, sample_rate=None):
+    coeffs = []
+    for f in filters:
+        if not f.get("freq") or not f.get("gain") or not f.get("q"):
+            continue
+        ftype = f.get("type")
+        if ftype == "LSQ":
+            coeffs.append(_autoeq_lowshelf(f["freq"], f["q"], f["gain"], sample_rate))
+        elif ftype == "HSQ":
+            coeffs.append(_autoeq_highshelf(f["freq"], f["q"], f["gain"], sample_rate))
+        elif ftype == "PK":
+            coeffs.append(_autoeq_peaking(f["freq"], f["q"], f["gain"], sample_rate))
+    return coeffs
+
+
+def autoeq_calc_gains(freqs, coeffs, sample_rate=None):
+    """Vectorized port of `calc_gains`; freqs is a 1-D numpy array."""
+    sample_rate = sample_rate or AUTOEQ_CONFIG["default_sample_rate"]
+    gains = np.zeros(len(freqs))
+    if not coeffs:
+        return gains
+
+    w = 2 * np.pi * freqs / sample_rate
+    phi = 4 * np.sin(w / 2) ** 2
+    for a0, a1, a2, b0, b1, b2 in coeffs:
+        num = (b0 + b1 + b2) ** 2 + (b0 * b2 * phi - (b1 * (b0 + b2) + 4 * b0 * b2)) * phi
+        den = (a0 + a1 + a2) ** 2 + (a0 * a2 * phi - (a1 * (a0 + a2) + 4 * a0 * a2)) * phi
+        gains += 10 * np.log10(np.maximum(num, 1e-12)) - 10 * np.log10(np.maximum(den, 1e-12))
+    return gains
+
+
+def autoeq_apply(fr, filters, sample_rate=None):
+    """fr: list of (freq, dB). Returns a new list of (freq, dB) with filters applied."""
+    freqs = np.array([f for f, _ in fr], dtype=float)
+    values = np.array([v for _, v in fr], dtype=float)
+    coeffs = autoeq_filters_to_coeffs(filters, sample_rate)
+    values = values + autoeq_calc_gains(freqs, coeffs, sample_rate)
+    return list(zip((f for f, _ in fr), values.tolist()))
+
+
+def autoeq_calc_preamp(fr1, fr2):
+    return -max(v2 - v1 for (_, v1), (_, v2) in zip(fr1, fr2))
+
+
+def autoeq_calc_distance(fr1, fr2):
+    v1 = np.array([v for _, v in fr1])
+    v2 = np.array([v for _, v in fr2])
+    d = np.abs(v1 - v2)
+    return float(np.mean(np.where(d >= 0.1, d, 0.0)))
+
+
+def autoeq_freq_unit(freq):
+    if freq < 100:
+        return 1
+    elif freq < 1000:
+        return 10
+    elif freq < 10000:
+        return 100
+    return 1000
+
+
+def autoeq_strip(filters):
+    min_q, max_q = AUTOEQ_CONFIG["optimize_q_range"]
+    min_gain, max_gain = AUTOEQ_CONFIG["optimize_gain_range"]
+    result = []
+    for f in filters:
+        unit = autoeq_freq_unit(f["freq"])
+        result.append({
+            "type": f["type"],
+            "freq": math.floor(f["freq"] - f["freq"] % unit),
+            "q": min(max(math.floor(f["q"] * 10) / 10, min_q), max_q),
+            "gain": min(max(math.floor(f["gain"] * 10) / 10, min_gain), max_gain),
+        })
+    return result
+
+
+def autoeq_search_candidates(fr, fr_target, threshold):
+    state = 0  # 1: peak, 0: matched, -1: dip
+    start_index = -1
+    candidates = []
+    min_freq, max_freq = AUTOEQ_CONFIG["autoeq_range"]
+
+    for i, (f, v0) in enumerate(fr):
+        v1 = fr_target[i][1]
+        delta = v0 - v1
+        delta_abs = abs(delta)
+        next_state = 0 if delta_abs < threshold else (1 if delta > 0 else -1)
+        if next_state == state:
+            continue
+
+        if start_index >= 0:
+            if state != 0:
+                start = fr[start_index][0]
+                end = f
+                center = math.sqrt(start * end)
+                gain = (
+                    autoeq_interp([center], fr_target[start_index:i + 1])[0][1] -
+                    autoeq_interp([center], fr[start_index:i + 1])[0][1]
+                )
+                q = center / (end - start)
+                if min_freq <= center <= max_freq:
+                    candidates.append({"type": "PK", "freq": center, "q": q, "gain": gain})
+            start_index = -1
+        else:
+            start_index = i
+        state = next_state
+
+    return candidates
+
+
+def autoeq_optimize(fr, fr_target, filters, iteration, dir_=False):
+    filters = autoeq_strip(filters)
+    min_freq, max_freq = AUTOEQ_CONFIG["autoeq_range"]
+    min_q, max_q = AUTOEQ_CONFIG["optimize_q_range"]
+    min_gain, max_gain = AUTOEQ_CONFIG["optimize_gain_range"]
+    max_df, max_dq, max_dg, step_df, step_dq, step_dg = (
+        AUTOEQ_CONFIG["optimize_deltas"][iteration])
+
+    indices = range(len(filters) - 1, -1, -1) if dir_ else range(len(filters))
+
+    for i in indices:
+        f = filters[i]
+        fr1 = autoeq_apply(fr, [ff for fi, ff in enumerate(filters) if fi != i])
+        fr2 = autoeq_apply(fr1, [f])
+        best_filter = dict(f)
+        best_distance = autoeq_calc_distance(fr2, fr_target)
+
+        def test_new_filter(df, dq, dg):
+            nonlocal best_filter, best_distance
+            freq = f["freq"] + df * autoeq_freq_unit(f["freq"]) * step_df
+            q = f["q"] + dq * step_dq
+            gain = f["gain"] + dg * step_dg
+            if (freq < min_freq or freq > max_freq or q < min_q or q > max_q
+                    or gain < min_gain or gain > max_gain):
+                return False
+            new_filter = {"type": f["type"], "freq": freq, "q": q, "gain": gain}
+            new_distance = autoeq_calc_distance(
+                autoeq_apply(fr1, [new_filter]), fr_target)
+            if new_distance < best_distance:
+                best_filter = new_filter
+                best_distance = new_distance
+                return True
+            return False
+
+        for df in range(-max_df, max_df):
+            for dq in range(max_dq - 1, -max_dq - 1, -1):
+                for dg in range(1, max_dg):
+                    if not test_new_filter(df, dq, dg):
+                        break
+                for dg in range(-1, -max_dg - 1, -1):
+                    if not test_new_filter(df, dq, dg):
+                        break
+
+        filters[i] = best_filter
+
+    if not dir_:
+        return autoeq_optimize(fr, fr_target, filters, iteration, True)
+
+    filters = sorted(filters, key=lambda x: x["freq"])
+
+    # Merge close filters.
+    i = 0
+    while i < len(filters) - 1:
+        f1, f2 = filters[i], filters[i + 1]
+        if (abs(f1["freq"] - f2["freq"]) <= autoeq_freq_unit(f1["freq"])
+                and abs(f1["q"] - f2["q"]) <= 0.1):
+            f1["gain"] += f2["gain"]
+            del filters[i + 1]
+        else:
+            i += 1
+
+    # Remove unnecessary filters.
+    best_distance = autoeq_calc_distance(autoeq_apply(fr, filters), fr_target)
+    i = 0
+    while i < len(filters):
+        if abs(filters[i]["gain"]) <= 0.1:
+            del filters[i]
+            continue
+        remaining = [ff for fi, ff in enumerate(filters) if fi != i]
+        new_distance = autoeq_calc_distance(autoeq_apply(fr, remaining), fr_target)
+        if new_distance < best_distance:
+            del filters[i]
+            best_distance = new_distance
+        else:
+            i += 1
+
+    return filters
+
+
+def autoeq_run(fr, fr_target, max_filters):
+    """Compute PK filters that reshape `fr` towards `fr_target`.
+
+    `fr` / `fr_target`: list of (freq, dB) on the same, ascending frequency grid.
+    """
+    deltas = AUTOEQ_CONFIG["optimize_deltas"]
+    first_batch_size = max(math.floor(max_filters / 2) - 1, 1)
+
+    first_candidates = autoeq_search_candidates(fr, fr_target, 1)
+    first_filters = sorted(
+        sorted(
+            (c for c in first_candidates
+             if c["freq"] <= AUTOEQ_CONFIG["treble_start_from"]),
+            key=lambda c: c["q"],
+        )[:first_batch_size],
+        key=lambda c: c["freq"],
+    )
+    for i in range(len(deltas)):
+        first_filters = autoeq_optimize(fr, fr_target, first_filters, i)
+
+    second_fr = autoeq_apply(fr, first_filters)
+    second_batch_size = max_filters - len(first_filters)
+    second_candidates = autoeq_search_candidates(second_fr, fr_target, 0.5)
+    second_filters = sorted(
+        sorted(second_candidates, key=lambda c: c["q"])[:second_batch_size],
+        key=lambda c: c["freq"],
+    )
+    for i in range(len(deltas)):
+        second_filters = autoeq_optimize(second_fr, fr_target, second_filters, i)
+
+    all_filters = first_filters + second_filters
+    for i in range(len(deltas)):
+        all_filters = autoeq_optimize(fr, fr_target, all_filters, i)
+
+    return autoeq_strip(all_filters)
+
+
+# ===========================================================================
 # GUI helpers
 # ===========================================================================
 
@@ -491,6 +996,11 @@ class EqLoaderGUI(tk.Tk):
         # Live editor state.
         self._loading_editor = False       # suppress traces while loading fields
         self._editor_snapshot_taken = False  # one undo step per edit session
+
+        # AutoEQ model database (lazily built the first time it's browsed).
+        self._autoeq_db_path = None
+        self._autoeq_model_index = None
+        self._autoeq_model_index_path = None
 
         self._build_widgets()
 
@@ -812,6 +1322,8 @@ class EqLoaderGUI(tk.Tk):
             ("Save Profile to File", self._create_save_profile, "TButton", "Ctrl+S", "<Control-s>"),
             ("Load Profile from File", self._create_load_profile, "TButton",
              "Ctrl+O", "<Control-o>"),
+            ("AutoEQ", self._create_autoeq, "TButton",
+             "Ctrl+Shift+A", "<Control-Shift-A>"),
             ("Push EQ to Device", self._create_push, "Accent.TButton", "Ctrl+P", "<Control-p>"),
         )
         for i, (text, cmd, style, accel, seq) in enumerate(action_btns):
@@ -1518,6 +2030,371 @@ class EqLoaderGUI(tk.Tk):
         self._refresh_create_tab()
         self._load_selected_filter_into_editor()
         self._log(f"Loaded {len(self.create_filters)} filter(s) from {path}\n")
+
+    # ------------------------------------------------------------------
+    # AutoEQ
+    # ------------------------------------------------------------------
+
+    def _show_busy_dialog(self, title, message):
+        """Modal indeterminate-progress dialog for a background task.
+
+        Caller is responsible for calling .destroy() on the returned Toplevel
+        (from the main thread, e.g. via self.after(0, ...)) once done.
+        """
+        dlg = tk.Toplevel(self)
+        dlg.title(title)
+        dlg.configure(bg=THEME["chassis"])
+        dlg.transient(self)
+        dlg.resizable(False, False)
+
+        ttk.Label(dlg, text=message, wraplength=320, justify="left").pack(
+            padx=24, pady=(20, 10))
+        bar = ttk.Progressbar(dlg, mode="indeterminate", length=280)
+        bar.pack(padx=24, pady=(0, 20))
+        bar.start(12)
+
+        dlg.protocol("WM_DELETE_WINDOW", lambda: None)  # not user-closable
+        dlg.grab_set()
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        return dlg
+
+    def _create_autoeq(self):
+        self._pick_autoeq_model(self._on_autoeq_model_chosen)
+
+    def _on_autoeq_model_chosen(self, measurement_path):
+        if not measurement_path:
+            return
+
+        try:
+            measurement = parse_frequency_response_file(measurement_path)
+        except Exception as e:
+            messagebox.showerror("AutoEQ", f"Could not read measurement file:\n{e}")
+            return
+
+        use_flat = messagebox.askyesno(
+            "AutoEQ Target",
+            "Use a flat (0 dB) target curve?\n\n"
+            "If you select 'No', you will be prompted to choose a target curve file (freq, dB per line).")
+
+        target_points = None
+        if not use_flat:
+            target_path = filedialog.askopenfilename(
+                title="Select Target Curve File (freq, dB per line)",
+                filetypes=[("Text/CSV files", "*.txt *.csv"), ("All files", "*.*")])
+            if not target_path:
+                return
+            try:
+                target_points = parse_frequency_response_file(target_path)
+            except Exception as e:
+                messagebox.showerror("AutoEQ", f"Could not read target file:\n{e}")
+                return
+
+        max_filters = self._parse_int(self.max_filter_entry.get(), DEFAULT_MAX_FILTERS)
+
+        busy = self._show_busy_dialog(
+            "AutoEQ",
+            "Running AutoEQ optimization...\nThis can take up to a minute "
+            "depending on the number of filters.")
+
+        def task():
+            print("Running AutoEQ optimization, this may take a while...")
+            try:
+                freqs = autoeq_raw_frequencies()
+                fr = autoeq_interp(freqs, measurement)
+                fr_target = (
+                    [(f, 0.0) for f in freqs] if target_points is None
+                    else autoeq_interp(freqs, target_points))
+
+                filters = autoeq_run(fr, fr_target, max_filters)
+                fr_eq = autoeq_apply(fr, filters)
+                preamp = autoeq_calc_preamp(fr, fr_eq)
+            except Exception:
+                self.after(0, busy.destroy)
+                raise
+            print(f"AutoEQ generated {len(filters)} band(s), preamp {preamp:.1f} dB")
+
+            def apply_result():
+                busy.destroy()
+                self._snapshot()
+                self.create_filters = [
+                    {
+                        "type": f["type"],
+                        "freq": round(f["freq"], 1),
+                        "gain": round(f["gain"], 2),
+                        "q": round(f["q"], 3),
+                    }
+                    for f in filters
+                ]
+                self.selected_filter = 0 if self.create_filters else -1
+                self.create_preamp_entry.delete(0, "end")
+                self.create_preamp_entry.insert(0, f"{preamp:.1f}")
+                self._refresh_create_tab()
+                self._load_selected_filter_into_editor()
+
+            self.after(0, apply_result)
+
+        self._run_bg(task)
+
+    def _pick_autoeq_model(self, callback):
+        """Search a measurement database by model name, à la autoeq.app.
+
+        Eventually calls `callback(measurement_path_or_None)` — asynchronously
+        when fetching the online database, since that hits the network.
+        """
+        if self._autoeq_model_index is not None:
+            callback(self._show_model_search_dialog())
+            return
+
+        saved = load_autoeq_db_path()
+        if saved == "online":
+            self._fetch_online_index(lambda: callback(self._show_model_search_dialog()))
+            return
+        if saved and os.path.isdir(saved):
+            self._ensure_local_autoeq_index(saved)
+            callback(self._show_model_search_dialog())
+            return
+
+        choice = self._prompt_for_autoeq_source()
+        if choice is None:
+            callback(None)
+            return
+        if choice == "online":
+            self._fetch_online_index(lambda: callback(self._show_model_search_dialog()))
+            return
+
+        chosen = filedialog.askdirectory(title="Select Measurement Database Folder")
+        if not chosen:
+            callback(None)
+            return
+        save_autoeq_db_path(chosen)
+        self._ensure_local_autoeq_index(chosen)
+        callback(self._show_model_search_dialog())
+
+    def _prompt_for_autoeq_source(self):
+        """Ask 'online database' vs 'local folder'. Returns 'online'/'local'/None."""
+        dlg = tk.Toplevel(self)
+        dlg.title("AutoEQ Model Database")
+        dlg.configure(bg=THEME["chassis"])
+        dlg.transient(self)
+        dlg.resizable(False, False)
+
+        ttk.Label(dlg, wraplength=380, justify="left", text=(
+            "No measurement database is configured yet.\n\n"
+            "Fetch the online AutoEQ database from GitHub "
+            "(jaakkopasanen/AutoEq), or point to a local folder of "
+            "measurement .txt files instead."
+        )).pack(padx=24, pady=(20, 16))
+
+        result = {"choice": None}
+        row = ttk.Frame(dlg)
+        row.pack(padx=16, pady=(0, 18))
+
+        def choose(c):
+            result["choice"] = c
+            dlg.destroy()
+
+        ttk.Button(row, text="Download Online Database", style="Accent.TButton",
+                   command=lambda: choose("online")).pack(side="left", padx=4)
+        ttk.Button(row, text="Choose Local Folder...",
+                   command=lambda: choose("local")).pack(side="left", padx=4)
+        ttk.Button(row, text="Cancel", command=lambda: choose(None)).pack(
+            side="left", padx=4)
+
+        dlg.bind("<Escape>", lambda _e: choose(None))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        dlg.grab_set()
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.wait_window(dlg)
+        return result["choice"]
+
+    def _ensure_local_autoeq_index(self, db_path):
+        self._autoeq_db_path = db_path
+        if self._autoeq_model_index is None or self._autoeq_model_index_path != db_path:
+            self._autoeq_model_index = build_autoeq_model_index(db_path)
+            self._autoeq_model_index_path = db_path
+
+    def _fetch_online_index(self, on_ready):
+        """Fetch the online index in the background; calls on_ready() when set."""
+        busy = self._show_busy_dialog(
+            "AutoEQ Model Database", "Fetching model list from GitHub...")
+
+        def task():
+            print("Fetching AutoEQ database listing from GitHub...")
+            try:
+                index = fetch_autoeq_online_index()
+            except Exception as e:
+                def fail():
+                    busy.destroy()
+                    messagebox.showerror(
+                        "AutoEQ Model Database",
+                        f"Could not fetch the online database:\n{e}")
+                self.after(0, fail)
+                return
+
+            print(f"Fetched {len(index)} model(s) from the online database.")
+
+            def apply():
+                busy.destroy()
+                self._autoeq_model_index = index
+                self._autoeq_model_index_path = "online"
+                self._autoeq_db_path = "online"
+                save_autoeq_db_path("online")
+                on_ready()
+            self.after(0, apply)
+
+        self._run_bg(task)
+
+    def _show_model_search_dialog(self):
+        c = THEME
+        dlg = tk.Toplevel(self)
+        dlg.title("Search Headphone Model")
+        dlg.configure(bg=c["chassis"])
+        dlg.transient(self)
+        dlg.geometry("700x480")
+        dlg.minsize(650, 360)
+
+        result = {"path": None}
+        filtered = []
+
+        top = ttk.Frame(dlg)
+        top.pack(fill="x", padx=12, pady=(12, 6))
+        ttk.Label(top, text="Search:").pack(side="left")
+        search_var = tk.StringVar()
+        entry = ttk.Entry(top, textvariable=search_var)
+        entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        list_frame = ttk.Frame(dlg)
+        list_frame.pack(fill="both", expand=True, padx=12, pady=6)
+        listbox = tk.Listbox(
+            list_frame, bg=c["panel"], fg=c["ink"],
+            selectbackground=c["accent"], selectforeground=c["chassis"],
+            highlightthickness=1, highlightbackground=c["line"],
+            borderwidth=0, activestyle="none", font=(self.font_ui, 10))
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        status_var = tk.StringVar()
+        ttk.Label(dlg, textvariable=status_var, style="Muted.TLabel").pack(
+            anchor="w", padx=12)
+
+        def refresh_list(*_args):
+            query = search_var.get().strip().lower()
+            listbox.delete(0, "end")
+            nonlocal filtered
+            if query:
+                terms = query.split()
+                filtered = [
+                    e for e in self._autoeq_model_index
+                    if all(t in e["label"].lower() or t in e["subtitle"].lower()
+                           for t in terms)
+                ]
+            else:
+                filtered = list(self._autoeq_model_index)
+            for e in filtered[:300]:
+                listbox.insert("end", f"{e['label']}   [{e['subtitle']}]")
+            status_var.set(
+                f"{len(filtered)} match(es) in {os.path.basename(self._autoeq_db_path)}"
+                + (" (showing first 300)" if len(filtered) > 300 else ""))
+
+        def choose(_event=None):
+            sel = listbox.curselection()
+            if not sel or sel[0] >= len(filtered):
+                return
+            entry_data = filtered[sel[0]]
+
+            if not entry_data.get("remote"):
+                result["path"] = entry_data["path"]
+                dlg.destroy()
+                return
+
+            select_btn.configure(state="disabled")
+            status_var.set(f"Downloading {entry_data['label']}...")
+
+            def task():
+                try:
+                    local_path = fetch_autoeq_remote_file(entry_data["path"])
+                except Exception as e:
+                    def fail():
+                        messagebox.showerror(
+                            "AutoEQ", f"Could not download measurement:\n{e}")
+                        select_btn.configure(state="normal")
+                        refresh_list()
+                    self.after(0, fail)
+                    return
+
+                def done():
+                    result["path"] = local_path
+                    dlg.destroy()
+                self.after(0, done)
+
+            self._run_bg(task)
+
+        def cancel():
+            dlg.destroy()
+
+        def browse_file():
+            path = filedialog.askopenfilename(
+                title="Select Measurement File (freq, dB per line)",
+                filetypes=[("Text/CSV files", "*.txt *.csv"), ("All files", "*.*")])
+            if path:
+                result["path"] = path
+                dlg.destroy()
+
+        def change_db():
+            choice = self._prompt_for_autoeq_source()
+            if choice is None:
+                return
+            if choice == "online":
+                status_var.set("Fetching online database...")
+                self._fetch_online_index(refresh_list)
+                return
+            chosen = filedialog.askdirectory(title="Select Measurement Database Folder")
+            if not chosen:
+                return
+            save_autoeq_db_path(chosen)
+            self._ensure_local_autoeq_index(chosen)
+            refresh_list()
+
+        search_var.trace_add("write", refresh_list)
+        listbox.bind("<Double-Button-1>", choose)
+        entry.bind("<Return>", lambda _e: choose() if filtered else None)
+        entry.bind("<Down>", lambda _e: (listbox.focus_set(), listbox.selection_set(0)))
+        dlg.bind("<Escape>", lambda _e: cancel())
+
+        row = ttk.Frame(dlg)
+        row.pack(fill="x", padx=12, pady=(6, 12))
+        ttk.Button(row, text="Browse File Instead...", command=browse_file).pack(
+            side="left")
+        ttk.Button(row, text="Change Database...", command=change_db).pack(
+            side="left", padx=(6, 0))
+        ttk.Button(row, text="Cancel", command=cancel).pack(side="right", padx=4)
+        select_btn = ttk.Button(row, text="Select", style="Accent.TButton", command=choose)
+        select_btn.pack(side="right", padx=4)
+
+        refresh_list()
+        # First result pre-selected so Enter works immediately.
+        if filtered:
+            listbox.selection_set(0)
+
+        dlg.protocol("WM_DELETE_WINDOW", cancel)
+        dlg.grab_set()
+        entry.focus_set()
+
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+        self.wait_window(dlg)
+        return result["path"]
 
     # ------------------------------------------------------------------
     # Device discovery

@@ -6,10 +6,11 @@ A standalone desktop tool for pushing and editing parametric EQ profiles on Walk
 
 ## Features
 
-- **Visual EQ editor** — drag band handles directly on the frequency response graph to tune frequency and gain interactively. Click empty space to add a new band; right-click a handle to delete it.
+- **Visual EQ editor** — drag band handles directly on the frequency response graph to tune frequency and gain interactively. Click empty space to add a new band; right-click a handle to delete it. The graph spans 20 Hz – 20 kHz with readable Hz/kHz axis labels.
+- **AutoEQ** — search a headphone/IEM model by name (from the online [AutoEq](https://github.com/jaakkopasanen/AutoEq) database or a local folder of measurements) and automatically generate parametric EQ bands plus a clip-safe preamp to correct it towards a flat or custom target.
 - **5 filter types** — Peaking (PK), Low Shelf (LSQ), High Shelf (HSQ), Low Pass (LP), High Pass (HP).
 - **Q / Bandwidth toggle** — switch the Q field to octave bandwidth and back without losing precision.
-- **Push to device** — write the current EQ to any PEQ slot with a configurable preamp level and hardware gain buffer.
+- **Push to device** — write the current EQ to any PEQ slot with a configurable preamp level and hardware gain buffer. Warns (with a "push anyway" option) if you have more bands than the device supports, since the extras would otherwise be silently dropped.
 - **Load from device** — read the current EQ back from the dongle into the editor.
 - **Save / load profiles** — read and write the standard `.txt` format used by eq.hangout.audio and EqualizerAPO, so existing community profiles work out of the box.
 - **OFF-band handling** — `OFF` bands and peaking/shelf filters with zero gain are automatically skipped when loading, matching the device's own behaviour.
@@ -50,7 +51,16 @@ The frequency-response graph is shown by default and hides automatically when th
 4. Add as many bands as the device supports (default: 8). Use **Delete Band** or right-click a handle on the graph to remove one.
 5. Set **Slot**, **Preamp**, and **Buffer** in the Created EQ row, then click **Push Created EQ** in the Actions panel.
 
-**Editing multiple bands at once:** Ctrl-click or Shift-click in the **Filters** list to select several bands. Changing a field in the **Selected Filter** panel applies that field to every selected band, and **Delete Band** removes them all.
+**Editing multiple bands at once:** Ctrl-click or Shift-click in the **Filters** list to select several bands. Changing a field in the **Selected Filter** panel applies that field to update readme with the new features that are important enugh to bethere
+every selected band, and **Delete Band** removes them all.
+
+### AutoEQ — generate an EQ from your headphone model
+
+1. Click **AutoEQ** (Ctrl+Shift+A).
+2. The first time, choose **Download Online Database** to fetch the public [AutoEq](https://github.com/jaakkopasanen/AutoEq) measurement database from GitHub, or **Choose Local Folder...** to point at your own folder of measurement `.txt`/`.csv` files. This choice is remembered for next time.
+3. In the search popup, type your headphone or IEM model name and pick the right entry (multiple measurement sources per model are labeled by their subfolder, e.g. `oratory1990` vs `Crinacle`). Online entries download on selection and are cached locally, so picking the same model again is instant. Use **Browse File Instead...** for a one-off local file, or **Change Database...** to switch source.
+4. Choose whether to target a flat (0 dB) response or load your own target curve file.
+5. The optimizer runs in the background (a progress dialog shows while it works — this can take up to a minute) and fills in the filter bands plus a clip-safe preamp automatically. Review and tweak as usual, then push.
 
 ### Loading an existing profile
 
@@ -67,7 +77,7 @@ The frequency-response graph is shown by default and hides automatically when th
 
 The **Max filters** field in the Device row (default `8`) is the number of PEQ slots your device stores.
 
-- **On push:** if your EQ has fewer bands than this, the remaining slots are padded with inert (0 dB) dummy bands so the device doesn't backfill them with copies of your last band.
+- **On push:** if your EQ has fewer bands than this, the remaining slots are padded with inert (0 dB) dummy bands so the device doesn't backfill them with copies of your last band. If it has *more* bands than this, pushing warns you first — only the first N bands would actually be written, with the rest silently dropped by the hardware — and lets you push anyway if that's what you want.
 - **On load:** exact-duplicate bands (which the device creates when padding its unused slots) are collapsed to a single band.
 
 Set this to match your device's actual slot count if it isn't 8.
@@ -92,6 +102,7 @@ Every action has a keyboard shortcut (also shown on the buttons themselves):
 | Ctrl+E | Load EQ from Device |
 | Ctrl+S | Save Profile to File |
 | Ctrl+O | Load Profile from File |
+| Ctrl+Shift+A | AutoEQ |
 | Ctrl+P | Push EQ to Device |
 | F5 | Refresh Device List |
 | Ctrl+G | Get Slot / Version |
