@@ -496,7 +496,11 @@ class EqLoaderGUI(tk.Tk):
         if self._graph_forced is False:
             self._set_graph_visible(False)
 
-        self.after(150, self._check_initial_graph_visibility)
+        # Evaluate initial graph visibility once the window is actually mapped
+        # (its real size is only known then); a timed call is a fallback in
+        # case <Map> was already delivered.
+        self.bind("<Map>", self._on_mapped, add="+")
+        self.after(200, self._mark_layout_ready)
         self._theme_classic_widgets()
         self._poll_log_queue()
 
@@ -850,9 +854,13 @@ class EqLoaderGUI(tk.Tk):
             if self._graph_forced is None:
                 self._graph_too_small_label.pack(expand=True)
 
-    def _check_initial_graph_visibility(self):
+    def _on_mapped(self, event):
+        if event.widget is self:
+            self._mark_layout_ready()
+
+    def _mark_layout_ready(self):
         self._layout_ready = True
-        self._apply_graph_visibility()
+        self.after_idle(self._apply_graph_visibility)
 
     def _on_window_resize(self, event):
         if not self._layout_ready or self._graph_forced is not None \
@@ -866,6 +874,9 @@ class EqLoaderGUI(tk.Tk):
         self._resize_after_id = None
         if self._graph_forced is not None:
             return
+        # Flush pending geometry so winfo_height() reflects the mapped size and
+        # not a stale value from before the window manager sized the window.
+        self.update_idletasks()
         win_h = self.winfo_height()
         if self.canvas_graph.get_tk_widget().winfo_ismapped():
             # While visible, the chrome above/below the graph is stable, so the
@@ -1356,7 +1367,7 @@ class EqLoaderGUI(tk.Tk):
     # Push / save / load profile
     # ------------------------------------------------------------------
 
-    def _create_push(self):
+    def _create_push(self, then=None):
         if not self.create_filters:
             messagebox.showwarning("No Filters", "Add at least one EQ band first.")
             return
@@ -1384,10 +1395,12 @@ class EqLoaderGUI(tk.Tk):
                       f"({len(filters)} slots)")
             finally:
                 dev.close()
+            if then is not None:
+                self.after(0, then)  # only reached when the push succeeded
 
         self._run_bg(task)
 
-    def _create_save_profile(self):
+    def _create_save_profile(self, then=None):
         if not self.create_filters:
             messagebox.showwarning("No Filters", "Add at least one EQ band first.")
             return
@@ -1404,6 +1417,9 @@ class EqLoaderGUI(tk.Tk):
             self._log(f"Profile saved to {path}\n")
         except Exception as e:
             messagebox.showerror("Save Error", str(e))
+            return
+        if then is not None:
+            then()
 
     def _create_load_profile(self):
         path = filedialog.askopenfilename(
@@ -1513,8 +1529,50 @@ class EqLoaderGUI(tk.Tk):
     # ------------------------------------------------------------------
 
     def _on_close(self):
-        if messagebox.askyesno("Quit", "Do you really want to leave this application?"):
-            self.destroy()
+        dlg = tk.Toplevel(self)
+        dlg.title("Quit")
+        dlg.configure(bg=THEME["chassis"])
+        dlg.transient(self)
+        dlg.resizable(False, False)
+
+        ttk.Label(dlg, text="Do you really want to leave this application?").pack(
+            padx=24, pady=(20, 16))
+
+        row = ttk.Frame(dlg)
+        row.pack(padx=16, pady=(0, 18))
+
+        def choose(action):
+            dlg.destroy()
+            if action == "quit":
+                self.destroy()
+            elif action == "push":
+                self._create_push(then=self.destroy)
+            elif action == "save":
+                self._create_save_profile(then=self.destroy)
+            # "cancel" just closes the dialog
+
+        quit_btn = ttk.Button(row, text="Quit", style="Danger.TButton",
+                              command=lambda: choose("quit"))
+        quit_btn.pack(side="left", padx=4)
+        ttk.Button(row, text="Cancel",
+                   command=lambda: choose("cancel")).pack(side="left", padx=4)
+        ttk.Button(row, text="Push to device and quit",
+                   command=lambda: choose("push")).pack(side="left", padx=4)
+        ttk.Button(row, text="Save to file and quit",
+                   command=lambda: choose("save")).pack(side="left", padx=4)
+
+        # Enter = Quit, Escape = Cancel.
+        dlg.bind("<Return>", lambda _e: choose("quit"))
+        dlg.bind("<KP_Enter>", lambda _e: choose("quit"))
+        dlg.bind("<Escape>", lambda _e: choose("cancel"))
+
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)  # dialog's own X = cancel
+        dlg.grab_set()
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        quit_btn.focus_set()
 
     # ------------------------------------------------------------------
     # Logging
