@@ -12,6 +12,7 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
+from matplotlib import ticker
 import numpy as np
 
 try:
@@ -1022,6 +1023,20 @@ class EqLoaderGUI(tk.Tk):
         self.ax.set_xscale("log")
         self.ax.set_xlim(20, 20000)
         self.ax.set_ylim(-15, 15)
+
+        def freq_formatter(x, pos):
+            if x >= 1000:
+                return f"{x/1000:.0f} kHz"
+            else:
+                return f"{x:.0f} Hz"
+
+        self.ax.xaxis.set_major_locator(ticker.LogLocator(base=10, numticks=10))
+        self.ax.xaxis.set_major_formatter(ticker.FuncFormatter(freq_formatter))
+
+        # Set custom ticks to show only 20 Hz and 20 kHz (exclude 0 and 22 kHz)
+        major_ticks = [20, 100, 1000, 10000, 20000]
+        self.ax.set_xticks(major_ticks)
+        self.ax.set_xticklabels([freq_formatter(t, None) for t in major_ticks])
 
         self.ax.grid(True, which="major", color=c["line"], linewidth=0.8, alpha=0.9)
         self.ax.grid(True, which="minor", color=c["line"], linewidth=0.5, alpha=0.4)
