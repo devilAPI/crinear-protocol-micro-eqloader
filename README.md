@@ -49,13 +49,13 @@ The Protocol Micro always attenuates its output by a fixed 5 dB, set as **Buffer
 
 ### AutoEQ
 
+![AutoEQ model search](screenshots/autoeq.png)
+
 1. Click **Compute AutoEQ** (Ctrl+Shift+A).
 2. The first time, choose **Download Online Database** (the AutoEq measurements on GitHub) or **Choose Local Folder...** with measurement `.txt`/`.csv` files. The choice is remembered.
 3. Search for your model and select it. The same model often has measurements from several sources, shown in brackets. Downloads are cached. **Browse File Instead...** uses a single local file, **Change Database...** switches the source.
 4. Pick a target: flat, a target from AutoEq's library (Harman, diffuse field, ...), or your own target file.
 5. The generated bands and preamp replace the current EQ. Review them, then push.
-
-![AutoEQ model search](screenshots/autoeq.png)
 
 > **Note:** Computing AutoEQ yourself is an experimental feature. It works, but results can differ from what autoeq.app or hangout.audio produce for the same measurement. For a well-tested result, use **Load Pre-computed AutoEQ** instead.
 
