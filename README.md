@@ -72,6 +72,61 @@ Use the **PEQ Enable / Disable** row to turn the hardware EQ on or off for a giv
 | Ctrl+Z | Undo |
 | Ctrl+Y / Ctrl+Shift+Z | Redo |
 
+## CLI
+
+All GUI features are also available headlessly, useful for scripting or automation, or embedding EQ Profiles into your Desktop Environment.
+
+### Push a profile to the device
+
+```
+python3 eqloader.py push <file> [options]
+```
+
+Loads a `.txt` profile and writes it to the device.
+
+| Option | Default | Description |
+|---|---|---|
+| `--slot N` | `0` | PEQ slot to write to |
+| `--buffer DB` | `0.0` | Hardware gain buffer in dB |
+| `--no-gain` | — | Skip writing the preamp gain |
+| `--no-enable` | — | Don't enable PEQ after pushing |
+| `--vid HEX` | `0x3302` | Override vendor ID |
+| `--pid HEX` | auto | Target a specific product ID |
+
+Example:
+
+```
+python3 eqloader.py push my_eq.txt --slot 1 --buffer 3.5
+```
+
+### Pull the current EQ from the device
+
+```
+python3 eqloader.py pull <file> [options]
+```
+
+Reads the active EQ from the dongle and saves it as a `.txt` profile.
+
+| Option | Default | Description |
+|---|---|---|
+| `--max-filters N` | `8` | Maximum number of bands to read |
+| `--vid HEX` | `0x3302` | Override vendor ID |
+| `--pid HEX` | auto | Target a specific product ID |
+
+Example:
+
+```
+python3 eqloader.py pull backup.txt
+```
+
+### List connected devices
+
+```
+python3 eqloader.py list
+```
+
+Prints all connected Walkplay HID devices with their VID, PID, and serial number.
+
 ## Profile format
 
 Profiles follow the EqualizerAPO / eq.hangout.audio `.txt` convention:

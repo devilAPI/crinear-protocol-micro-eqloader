@@ -2591,9 +2591,109 @@ class EqLoaderGUI(tk.Tk):
 
 
 # ===========================================================================
+# ---- CLI ----
+# ===========================================================================
+
+def _cli_push(args):
+    vid = int(args.vid, 0) if args.vid else WALKPLAY_VENDOR_ID
+    pid = int(args.pid, 0) if args.pid else None
+
+    profile = load_profile(args.file)
+    filters = [
+        f for f in profile["filters"]
+        if not f.get("disabled", is_filter_disabled(
+            f.get("type", "PK"), f["freq"], f["gain"], f["q"]
+        ))
+    ]
+
+    dev = open_device(vid=vid, pid=pid)
+    try:
+        push_to_device(
+            dev,
+            slot=args.slot,
+            global_gain=profile["preamp"],
+            filters=filters,
+            buffer_db=args.buffer,
+            write_gain=not args.no_gain,
+        )
+        if not args.no_enable:
+            enable_peq(dev, True, slot_id=args.slot)
+            print(f"PEQ enabled on slot {args.slot}")
+    finally:
+        dev.close()
+
+
+def _cli_pull(args):
+    vid = int(args.vid, 0) if args.vid else WALKPLAY_VENDOR_ID
+    pid = int(args.pid, 0) if args.pid else None
+
+    dev = open_device(vid=vid, pid=pid)
+    try:
+        slot = get_current_slot(dev)
+        result = pull_from_device(dev, max_filters=args.max_filters, slot_hint=slot)
+        save_profile(args.file, result["globalGain"], result["filters"])
+        print(f"Saved {len(result['filters'])} filter(s) to {args.file}")
+    finally:
+        dev.close()
+
+
+def _cli_list(_args):
+    list_devices()
+
+
+def _build_parser():
+    import argparse
+
+    p = argparse.ArgumentParser(
+        prog="eqloader",
+        description="Walkplay PEQ loader — run without arguments to open the GUI.",
+    )
+    sub = p.add_subparsers(dest="cmd")
+
+    # ---- push ----
+    pp = sub.add_parser("push", help="Push a .txt profile to the device")
+    pp.add_argument("file", help="Profile .txt file to push")
+    pp.add_argument("--slot",     type=int,   default=0,
+                    help="Target PEQ slot (default: 0)")
+    pp.add_argument("--buffer",   type=float, default=DEFAULT_GLOBAL_GAIN_BUFFER,
+                    help=f"Hardware gain buffer in dB (default: {DEFAULT_GLOBAL_GAIN_BUFFER})")
+    pp.add_argument("--no-gain",  action="store_true",
+                    help="Skip writing the global gain register")
+    pp.add_argument("--no-enable", action="store_true",
+                    help="Don't enable PEQ after pushing")
+    pp.add_argument("--vid",      default=None, help="Device VID in hex (default: 0x3302)")
+    pp.add_argument("--pid",      default=None, help="Device PID in hex (optional)")
+
+    # ---- pull ----
+    pu = sub.add_parser("pull", help="Pull the current EQ from the device to a .txt file")
+    pu.add_argument("file", help="Output .txt file")
+    pu.add_argument("--max-filters", type=int, default=DEFAULT_MAX_FILTERS,
+                    help=f"Number of filter slots to read (default: {DEFAULT_MAX_FILTERS})")
+    pu.add_argument("--vid", default=None, help="Device VID in hex (default: 0x3302)")
+    pu.add_argument("--pid", default=None, help="Device PID in hex (optional)")
+
+    # ---- list ----
+    sub.add_parser("list", help="List connected Walkplay HID devices")
+
+    return p
+
+
+# ===========================================================================
 # ---- Main ----
 # ===========================================================================
 
 if __name__ == "__main__":
-    app = EqLoaderGUI()
-    app.mainloop()
+    import argparse
+
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    if args.cmd == "push":
+        _cli_push(args)
+    elif args.cmd == "pull":
+        _cli_pull(args)
+    elif args.cmd == "list":
+        _cli_list(args)
+    else:
+        app = EqLoaderGUI()
+        app.mainloop()
