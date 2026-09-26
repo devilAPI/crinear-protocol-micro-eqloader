@@ -14,7 +14,6 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 import numpy as np
 
-
 try:
     import hid
 except ImportError:
@@ -38,7 +37,7 @@ THEME = {
     "danger":    "#E5687A",  # destructive action
 }
 
-# Numeric readouts and the log read like a hardware display: monospace.
+# Numeric readouts and th  ● Claude has context of ⧉ open files and ⧉ selected linese log read like a hardware display: monospace.
 MONO_FONTS = ("JetBrains Mono", "DejaVu Sans Mono", "Consolas", "Menlo",
               "Courier New", "monospace")
 UI_FONTS = ("Inter", "Segoe UI", "Helvetica Neue", "DejaVu Sans", "sans-serif")
@@ -750,9 +749,9 @@ def load_profile(path):
             enabled, txt_type, freq, gain, q = m.groups()
 
             if enabled.upper() == "OFF":
-                filters.append(
-                    dict(INERT_FILTER)
-                )
+                f = dict(INERT_FILTER)
+                f["disabled"] = True
+                filters.append(f)
 
                 continue
 
@@ -2771,7 +2770,16 @@ class EqLoaderGUI(tk.Tk):
 
         self._snapshot()
         self.create_filters = [
-            dict(f) for f in data["filters"]
+            {
+                "type": f.get("type", "PK"),
+                "freq": float(f["freq"]) or 1000.0,
+                "gain": float(f["gain"]),
+                "q": float(f["q"]) or 1.0,
+            }
+            for f in data["filters"]
+            if not f.get("disabled", is_filter_disabled(
+                f.get("type", "PK"), f["freq"], f["gain"], f["q"]
+            ))
         ]
 
         self.selected_filter = (
