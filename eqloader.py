@@ -22,6 +22,42 @@ except ImportError:
 
 
 # ===========================================================================
+# ---- Theme: "instrument panel" (graphite chassis, two-LED accent) ----
+# ===========================================================================
+
+THEME = {
+    "chassis":   "#14161A",  # deep graphite base
+    "panel":     "#1C1F26",  # raised frame / surface
+    "input":     "#262A33",  # entries, hover
+    "line":      "#2E333D",  # hairline borders / grid
+    "ink":       "#E6E9EF",  # primary text
+    "muted":     "#8A93A3",  # secondary labels
+    "accent":    "#4ED0C4",  # cyan signal / idle trace
+    "accent_dk": "#2C8F87",  # pressed / darker cyan
+    "active":    "#F0A93B",  # amber, selected band
+    "danger":    "#E5687A",  # destructive action
+}
+
+# Numeric readouts and the log read like a hardware display: monospace.
+MONO_FONTS = ("JetBrains Mono", "DejaVu Sans Mono", "Consolas", "Menlo",
+              "Courier New", "monospace")
+UI_FONTS = ("Inter", "Segoe UI", "Helvetica Neue", "DejaVu Sans", "sans-serif")
+
+
+def _pick_font(root, families):
+    """Return the first font family actually installed, else the last fallback."""
+    try:
+        import tkinter.font as tkfont
+        available = {f.lower() for f in tkfont.families(root)}
+        for fam in families:
+            if fam.lower() in available:
+                return fam
+    except Exception:
+        pass
+    return families[-1]
+
+
+# ===========================================================================
 # ---- Core protocol / CLI logic (ported unchanged from eqloader.py) ----
 # ===========================================================================
 
@@ -821,6 +857,8 @@ class EqLoaderGUI(tk.Tk):
 
         self.minsize(850, 700)
 
+        self._apply_theme()
+
         self.log_queue = queue.Queue()
 
         self.selected_path = None
@@ -846,6 +884,8 @@ class EqLoaderGUI(tk.Tk):
 
         self._build_widgets()
 
+        self._theme_classic_widgets()
+
         self._poll_log_queue()
 
         if hid is None:
@@ -853,6 +893,175 @@ class EqLoaderGUI(tk.Tk):
                 "ERROR: the 'hidapi' package is not installed.\n"
                 "Run:  pip install hidapi\n"
                 "Then restart this app.\n"
+            )
+
+    # ------------------------------------------------------------------
+    # Theme
+    # ------------------------------------------------------------------
+
+    def _apply_theme(self):
+        """Skin every ttk widget as a graphite instrument panel."""
+
+        c = THEME
+
+        self.font_ui = _pick_font(self, UI_FONTS)
+        self.font_mono = _pick_font(self, MONO_FONTS)
+
+        self.configure(bg=c["chassis"])
+
+        style = ttk.Style(self)
+        # 'clam' is the one built-in theme that honours colour overrides.
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        base_font = (self.font_ui, 10)
+        label_font = (self.font_ui, 10)
+        mono_font = (self.font_mono, 10)
+
+        style.configure(".",
+                        background=c["chassis"],
+                        foreground=c["ink"],
+                        fieldbackground=c["input"],
+                        bordercolor=c["line"],
+                        lightcolor=c["line"],
+                        darkcolor=c["line"],
+                        troughcolor=c["panel"],
+                        font=base_font)
+
+        style.configure("TFrame", background=c["chassis"])
+        style.configure("TLabel", background=c["chassis"],
+                        foreground=c["ink"], font=label_font)
+        # Muted caption label variant.
+        style.configure("Muted.TLabel", background=c["chassis"],
+                        foreground=c["muted"], font=(self.font_ui, 9))
+
+        # Framed panels with a soft caption.
+        style.configure("TLabelframe", background=c["chassis"],
+                        bordercolor=c["line"], relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background=c["chassis"],
+                        foreground=c["muted"],
+                        font=(self.font_ui, 9, "bold"))
+
+        # Inputs.
+        for widget in ("TEntry", "TSpinbox", "TCombobox"):
+            style.configure(widget,
+                            fieldbackground=c["input"],
+                            foreground=c["ink"],
+                            insertcolor=c["accent"],
+                            bordercolor=c["line"],
+                            arrowcolor=c["muted"],
+                            padding=4)
+            style.map(widget,
+                      bordercolor=[("focus", c["accent"])],
+                      foreground=[("disabled", c["muted"])])
+
+        # Buttons: quiet by default, cyan chassis-LED on hover.
+        style.configure("TButton",
+                        background=c["input"],
+                        foreground=c["ink"],
+                        bordercolor=c["line"],
+                        focuscolor=c["accent"],
+                        relief="flat",
+                        padding=(10, 6),
+                        font=(self.font_ui, 10))
+        style.map("TButton",
+                  background=[("pressed", c["accent_dk"]),
+                             ("active", c["line"])],
+                  foreground=[("pressed", c["chassis"])],
+                  bordercolor=[("active", c["accent"])])
+
+        # Primary call-to-action: solid cyan.
+        style.configure("Accent.TButton",
+                        background=c["accent"],
+                        foreground=c["chassis"],
+                        relief="flat",
+                        padding=(10, 6),
+                        font=(self.font_ui, 10, "bold"))
+        style.map("Accent.TButton",
+                  background=[("pressed", c["accent_dk"]),
+                             ("active", c["accent_dk"])],
+                  foreground=[("active", c["chassis"])])
+
+        # Destructive action.
+        style.configure("Danger.TButton",
+                        background=c["input"],
+                        foreground=c["danger"],
+                        relief="flat",
+                        padding=(10, 6))
+        style.map("Danger.TButton",
+                  background=[("active", c["danger"]),
+                             ("pressed", c["danger"])],
+                  foreground=[("active", c["chassis"]),
+                              ("pressed", c["chassis"])])
+
+        style.configure("TCheckbutton",
+                        background=c["chassis"],
+                        foreground=c["ink"],
+                        focuscolor=c["accent"])
+        style.map("TCheckbutton",
+                  background=[("active", c["chassis"])],
+                  indicatorcolor=[("selected", c["accent"]),
+                                  ("!selected", c["input"])])
+
+        # Notebook tabs read like channel selectors.
+        style.configure("TNotebook", background=c["chassis"],
+                        bordercolor=c["line"], tabmargins=(2, 4, 2, 0))
+        style.configure("TNotebook.Tab",
+                        background=c["panel"],
+                        foreground=c["muted"],
+                        bordercolor=c["line"],
+                        padding=(14, 7),
+                        font=(self.font_ui, 10))
+        style.map("TNotebook.Tab",
+                  background=[("selected", c["chassis"])],
+                  foreground=[("selected", c["accent"]),
+                              ("active", c["ink"])])
+
+        # Scrollbars: thin, chassis-toned.
+        for sb in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(sb,
+                            background=c["input"],
+                            troughcolor=c["panel"],
+                            bordercolor=c["panel"],
+                            arrowcolor=c["muted"])
+            style.map(sb, background=[("active", c["line"])])
+
+    def _theme_classic_widgets(self):
+        """Colour the non-ttk (classic tk) widgets to match the theme."""
+
+        c = THEME
+        list_opts = dict(
+            bg=c["panel"],
+            fg=c["ink"],
+            selectbackground=c["accent"],
+            selectforeground=c["chassis"],
+            highlightthickness=1,
+            highlightbackground=c["line"],
+            highlightcolor=c["accent"],
+            borderwidth=0,
+            activestyle="none",
+            font=(self.font_mono, 10),
+        )
+        for lb in (getattr(self, "device_list", None),
+                   getattr(self, "filter_list", None)):
+            if lb is not None:
+                lb.configure(**list_opts)
+
+        if getattr(self, "log_text", None) is not None:
+            self.log_text.configure(
+                bg=c["chassis"],
+                fg=c["accent"],
+                insertbackground=c["accent"],
+                selectbackground=c["input"],
+                selectforeground=c["ink"],
+                highlightthickness=1,
+                highlightbackground=c["line"],
+                borderwidth=0,
+                font=(self.font_mono, 9),
+                padx=8,
+                pady=6,
             )
 
     # ------------------------------------------------------------------
@@ -1106,7 +1315,8 @@ class EqLoaderGUI(tk.Tk):
         ttk.Button(
             pull_frame,
             text="Pull from Device",
-            command=self._pull
+            command=self._pull,
+            style="Accent.TButton"
         ).grid(
             row=2,
             column=0,
@@ -1244,7 +1454,8 @@ class EqLoaderGUI(tk.Tk):
         ttk.Button(
             push_frame,
             text="Push to Device",
-            command=self._push
+            command=self._push,
+            style="Accent.TButton"
         ).grid(
             row=4,
             column=0,
@@ -1274,10 +1485,12 @@ class EqLoaderGUI(tk.Tk):
 
         self.fig = Figure(
             figsize=(7, 4),
-            dpi=100
+            dpi=100,
+            facecolor=THEME["chassis"],
         )
 
         self.ax = self.fig.add_subplot(111)
+        self.ax.set_facecolor(THEME["panel"])
 
         self.canvas_graph = FigureCanvasTkAgg(
             self.fig,
@@ -1501,7 +1714,8 @@ class EqLoaderGUI(tk.Tk):
         ttk.Button(
             button_frame,
             text="Apply",
-            command=self._create_apply
+            command=self._create_apply,
+            style="Accent.TButton"
         ).pack(
             side="left",
             padx=2
@@ -1519,7 +1733,8 @@ class EqLoaderGUI(tk.Tk):
         ttk.Button(
             button_frame,
             text="Delete Band",
-            command=self._create_delete_band
+            command=self._create_delete_band,
+            style="Danger.TButton"
         ).pack(
             side="left",
             padx=2
@@ -1528,7 +1743,8 @@ class EqLoaderGUI(tk.Tk):
         ttk.Button(
             button_frame,
             text="Delete All",
-            command=self._create_delete_all_bands
+            command=self._create_delete_all_bands,
+            style="Danger.TButton"
         ).pack(
             side="left",
             padx=2
@@ -1632,7 +1848,8 @@ class EqLoaderGUI(tk.Tk):
         ttk.Button(
             push_created_frame,
             text="Push Created EQ",
-            command=self._create_push
+            command=self._create_push,
+            style="Accent.TButton"
         ).pack(
             side="left",
             padx=12,
@@ -1700,7 +1917,8 @@ class EqLoaderGUI(tk.Tk):
         ttk.Button(
             ed_tab,
             text="Enable PEQ",
-            command=self._enable
+            command=self._enable,
+            style="Accent.TButton"
         ).grid(
             row=1,
             column=0,
@@ -1711,7 +1929,8 @@ class EqLoaderGUI(tk.Tk):
         ttk.Button(
             ed_tab,
             text="Disable PEQ",
-            command=self._disable
+            command=self._disable,
+            style="Danger.TButton"
         ).grid(
             row=1,
             column=1,
@@ -1900,29 +2119,66 @@ class EqLoaderGUI(tk.Tk):
                 f.get("type", "PK"),
             )
 
-            color = (
-                "red"
-                if index == self.selected_filter
-                else "black"
-            )
+            is_selected = index == self.selected_filter
+            color = THEME["active"] if is_selected else THEME["accent"]
+
+            # Amber glow halo around the active band's handle.
+            if is_selected:
+                self.ax.plot(
+                    [center_freq], [gain],
+                    marker="o", markersize=16,
+                    color=THEME["active"], alpha=0.25,
+                    zorder=4,
+                )
 
             self.ax.plot(
-                [center_freq],
-                [gain],
-                marker="o",
-                markersize=8,
-                color=color,
+                [center_freq], [gain],
+                marker="o", markersize=9,
+                markerfacecolor=color,
+                markeredgecolor=THEME["chassis"],
+                markeredgewidth=1.5,
+                zorder=5,
             )
 
-        self.ax.plot(freqs, response, linewidth=2, color="tab:blue")
-        self.ax.axhline(0, color="gray", linewidth=0.8)
+        c = THEME
+        self.fig.set_facecolor(c["chassis"])
+        self.ax.set_facecolor(c["panel"])
+
+        # Filled scope trace with a soft glow underneath.
+        self.ax.fill_between(freqs, response, 0,
+                             color=c["accent"], alpha=0.10, zorder=1)
+        for lw, a in ((5, 0.10), (3, 0.18)):  # glow layers
+            self.ax.plot(freqs, response, linewidth=lw,
+                         color=c["accent"], alpha=a, zorder=2)
+        self.ax.plot(freqs, response, linewidth=2.0,
+                     color=c["accent"], zorder=3)
+
+        # 0 dB reference line.
+        self.ax.axhline(0, color=c["muted"], linewidth=0.8,
+                        alpha=0.6, zorder=1)
+
         self.ax.set_xscale("log")
         self.ax.set_xlim(20, 20000)
         self.ax.set_ylim(-15, 15)
-        self.ax.grid(True, which="both", alpha=0.3)
-        self.ax.set_title("EQ Response Preview")
-        self.ax.set_xlabel("Frequency (Hz)")
-        self.ax.set_ylabel("Gain (dB)")
+
+        self.ax.grid(True, which="major", color=c["line"],
+                     linewidth=0.8, alpha=0.9)
+        self.ax.grid(True, which="minor", color=c["line"],
+                     linewidth=0.5, alpha=0.4)
+
+        # Frame: hairline spines, muted ticks/labels.
+        for side, spine in self.ax.spines.items():
+            spine.set_color(c["line"])
+            spine.set_visible(side in ("left", "bottom"))
+        self.ax.tick_params(colors=c["muted"], labelsize=8, which="both")
+
+        self.ax.set_title("EQ RESPONSE", color=c["muted"],
+                          fontsize=10, fontweight="bold", loc="left",
+                          fontfamily=self.font_mono, pad=10)
+        self.ax.set_xlabel("Frequency (Hz)", color=c["muted"], fontsize=9)
+        self.ax.set_ylabel("Gain (dB)", color=c["muted"], fontsize=9)
+
+        self.fig.tight_layout()
         self.canvas_graph.draw_idle()
 
     def _create_add_band(self):
