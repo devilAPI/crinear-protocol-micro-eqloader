@@ -1653,9 +1653,9 @@ class EqLoaderGUI(tk.Tk):
             spine.set_visible(side in ("left", "bottom"))
         self.ax.tick_params(colors=c["muted"], labelsize=8, which="both")
 
-        self.ax.set_title("EQ RESPONSE", color=c["muted"],
+        self.ax.set_title("EQ Response", color=c["muted"],
                           fontsize=10, fontweight="bold", loc="left",
-                          fontfamily=self.font_mono, pad=10)
+                          fontfamily=self.font_ui, pad=10)
         self.ax.set_xlabel("Frequency (Hz)", color=c["muted"], fontsize=9)
         self.ax.set_ylabel("Gain (dB)", color=c["muted"], fontsize=9)
 
