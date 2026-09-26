@@ -7,7 +7,8 @@ A standalone desktop tool for pushing and editing parametric EQ profiles on Walk
 ## Features
 
 - **Visual EQ editor** — drag band handles directly on the frequency response graph to tune frequency and gain interactively. Click empty space to add a new band; right-click a handle to delete it. The graph spans 20 Hz – 20 kHz with readable Hz/kHz axis labels.
-- **AutoEQ** — search a headphone/IEM model by name (from the online [AutoEq](https://github.com/jaakkopasanen/AutoEq) database or a local folder of measurements) and automatically generate parametric EQ bands plus a clip-safe preamp to correct it towards a flat or custom target.
+- **AutoEQ** — search a headphone/IEM model by name (from the online [AutoEq](https://github.com/jaakkopasanen/AutoEq) database or a local folder of measurements) and automatically generate parametric EQ bands plus a clip-safe preamp to correct it towards a flat, AutoEQ-library, or custom target.
+- **Load Pre-computed Profile** — skip running the optimizer yourself: fetch a `ParametricEQ.txt` the AutoEQ project has already computed for a model, straight from its GitHub `results/` folder.
 - **5 filter types** — Peaking (PK), Low Shelf (LSQ), High Shelf (HSQ), Low Pass (LP), High Pass (HP).
 - **Q / Bandwidth toggle** — switch the Q field to octave bandwidth and back without losing precision.
 - **Push to device** — write the current EQ to any PEQ slot with a configurable preamp level and hardware gain buffer. Warns (with a "push anyway" option) if you have more bands than the device supports, since the extras would otherwise be silently dropped.
@@ -61,6 +62,8 @@ The frequency-response graph is shown by default and hides automatically when th
 4. Pick a target curve: flat (0 dB), search AutoEQ's own online target library (Harman, diffuse-field, and more — fetched and cached the same way as measurements), or load your own target curve file.
 5. The optimizer runs in the background (a progress dialog shows while it works — this can take up to a minute) and fills in the filter bands plus a clip-safe preamp automatically. Review and tweak as usual, then push.
 
+**Skip the optimizer — load an already-computed profile:** click **Load Pre-computed Profile...** (Ctrl+Shift+L) instead, pick a model from the online database the same way, and it fetches the matching `ParametricEQ.txt` the AutoEQ project already generated (via its own pipeline against a Harman-style target) rather than running AutoEQ locally. If a model has more than one variant (different target presets), you'll get to pick which one. Only available for models picked from the online database, not a local folder/file.
+
 ### Loading an existing profile
 
 1. Click **Load Profile** in the Actions panel and select a `.txt` file.
@@ -102,6 +105,7 @@ Every action has a keyboard shortcut (also shown on the buttons themselves):
 | Ctrl+S | Save Profile to File |
 | Ctrl+O | Load Profile from File |
 | Ctrl+Shift+A | AutoEQ |
+| Ctrl+Shift+L | Load Pre-computed Profile |
 | Ctrl+P | Push EQ to Device |
 | F5 | Refresh Device List |
 | Ctrl+G | Get Slot / Version |

@@ -359,8 +359,11 @@ def enable_peq(dev, enable, slot_id=0):
 # Profile .txt format
 # ===========================================================================
 
-TXT_TYPE_TO_INTERNAL = {"LS": "LSQ", "HS": "HSQ", "PK": "PK", "LP": "LP", "HP": "HP"}
-INTERNAL_TYPE_TO_TXT = {v: k for k, v in TXT_TYPE_TO_INTERNAL.items()}
+TXT_TYPE_TO_INTERNAL = {
+    "LS": "LSQ", "LSC": "LSQ", "HS": "HSQ", "HSC": "HSQ",
+    "PK": "PK", "LP": "LP", "HP": "HP",
+}
+INTERNAL_TYPE_TO_TXT = {"LSQ": "LS", "HSQ": "HS", "PK": "PK", "LP": "LP", "HP": "HP"}
 
 INERT_FILTER = {"type": "PK", "freq": 100.0, "gain": 0.0, "q": 1.0}
 
@@ -566,22 +569,27 @@ def _autoeq_github_get(url):
         return json.load(resp)
 
 
-def _autoeq_github_subtree(dir_name):
-    """Fetch just one top-level folder's subtree (by its own tree sha) rather
-    than the whole repo's recursive tree, which is large enough to get
-    truncated by GitHub's API before reaching every file."""
-    root = _autoeq_github_get(f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{AUTOEQ_GITHUB_BRANCH}")
-    dir_entry = next(
-        (e for e in root.get("tree", [])
-         if e.get("path") == dir_name and e.get("type") == "tree"),
-        None)
-    if dir_entry is None:
-        raise RuntimeError(f"'{dir_name}' folder not found in repo")
+def _autoeq_github_subtree(dir_path):
+    """Fetch one folder's subtree (by its own tree sha) rather than the
+    whole repo's recursive tree, which is large enough to get truncated by
+    GitHub's API before reaching every file. `dir_path` may be nested
+    ('results/oratory1990'), walked one level at a time since each level's
+    sha is only known from its parent's (non-recursive) listing.
+    """
+    tree_sha = AUTOEQ_GITHUB_BRANCH
+    for part in dir_path.split("/"):
+        listing = _autoeq_github_get(f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{tree_sha}")
+        entry = next(
+            (e for e in listing.get("tree", [])
+             if e.get("path") == part and e.get("type") == "tree"),
+            None)
+        if entry is None:
+            raise RuntimeError(f"'{dir_path}' folder not found in repo")
+        tree_sha = entry["sha"]
 
-    sub = _autoeq_github_get(
-        f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{dir_entry['sha']}?recursive=1")
+    sub = _autoeq_github_get(f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{tree_sha}?recursive=1")
     if sub.get("truncated"):
-        print(f"Warning: GitHub '{dir_name}' listing was truncated; some entries may be missing.")
+        print(f"Warning: GitHub '{dir_path}' listing was truncated; some entries may be missing.")
     return sub.get("tree", [])
 
 
@@ -629,6 +637,34 @@ def fetch_autoeq_targets_index():
         })
     index.sort(key=lambda e: e["label"].lower())
     return index
+
+
+AUTOEQ_RESULTS_DIR = "results"
+
+
+def fetch_autoeq_precomputed_profiles(source, model_stem):
+    """Find ParametricEQ.txt file(s) the AutoEQ project has already computed
+    for `model_stem` under results/<source>/ — a legitimately open,
+    pre-made-profile alternative to running AutoEQ's optimizer yourself.
+    There can be more than one match, since results/ keeps one variant per
+    target preset used (e.g. Harman with/without bass).
+    """
+    tree = _autoeq_github_subtree(f"{AUTOEQ_RESULTS_DIR}/{source}")
+    matches = []
+    for entry in tree:
+        path = entry.get("path", "")
+        if entry.get("type") != "blob" or not path.endswith("ParametricEQ.txt"):
+            continue
+        parent = Path(path).parent
+        if parent.name != model_stem:
+            continue
+        variant = str(parent.parent)
+        matches.append({
+            "label": source if variant in (".", "") else f"{source} / {variant}",
+            "path": f"{AUTOEQ_RESULTS_DIR}/{source}/{path}",
+        })
+    matches.sort(key=lambda m: m["label"])
+    return matches
 
 
 def fetch_autoeq_remote_file(repo_path):
@@ -1503,8 +1539,10 @@ class EqLoaderGUI(tk.Tk):
             ("Save Profile to File", self._create_save_profile, "TButton", "Ctrl+S", "<Control-s>"),
             ("Load Profile from File", self._create_load_profile, "TButton",
              "Ctrl+O", "<Control-o>"),
-            ("AutoEQ", self._create_autoeq, "TButton",
+            ("Compute AutoEQ", self._create_autoeq, "TButton",
              "Ctrl+Shift+A", "<Control-Shift-A>"),
+            ("Load Pre-computed AutoEQ...", self._create_load_autoeq_profile, "TButton",
+             "Ctrl+Shift+L", "<Control-Shift-L>"),
             ("Push EQ to Device", self._create_push, "Accent.TButton", "Ctrl+P", "<Control-p>"),
         )
         for i, (text, cmd, style, accel, seq) in enumerate(action_btns):
@@ -2245,7 +2283,7 @@ class EqLoaderGUI(tk.Tk):
     def _create_autoeq(self):
         self._pick_autoeq_model(self._on_autoeq_model_chosen)
 
-    def _on_autoeq_model_chosen(self, measurement_path):
+    def _on_autoeq_model_chosen(self, measurement_path, _entry=None):
         if not measurement_path:
             return
 
@@ -2257,6 +2295,147 @@ class EqLoaderGUI(tk.Tk):
 
         self._pick_autoeq_target(
             lambda target_points: self._run_autoeq(measurement, target_points))
+
+    def _create_load_autoeq_profile(self):
+        """Skip running the optimizer: fetch a ParametricEQ.txt the AutoEQ
+        project has already computed for a model, straight from GitHub."""
+        self._pick_autoeq_model(self._on_precomputed_model_chosen)
+
+    def _on_precomputed_model_chosen(self, path, entry):
+        if not path:
+            return
+        if not entry or not entry.get("remote"):
+            messagebox.showinfo(
+                "Pre-computed Profile",
+                "Pre-computed profiles are only available for models picked "
+                "from the online AutoEQ database, not local files/folders.")
+            return
+
+        # entry["path"] looks like "measurements/<source>/data/<category>/<model>.csv"
+        parts = entry["path"].split("/")
+        if len(parts) < 2:
+            messagebox.showerror(
+                "Pre-computed Profile", "Could not determine the measurement source.")
+            return
+        source = parts[1]
+        model_stem = entry["label"]
+
+        busy = self._show_busy_dialog(
+            "Pre-computed Profile",
+            f"Looking up pre-computed EQ profile(s) for {model_stem}...")
+
+        def task():
+            try:
+                candidates = fetch_autoeq_precomputed_profiles(source, model_stem)
+            except Exception as e:
+                def fail():
+                    busy.destroy()
+                    messagebox.showerror("Pre-computed Profile", f"Lookup failed:\n{e}")
+                self.after(0, fail)
+                return
+
+            def after_lookup():
+                busy.destroy()
+                if not candidates:
+                    messagebox.showinfo(
+                        "Pre-computed Profile",
+                        f"No pre-computed ParametricEQ.txt found for {model_stem} "
+                        f"under '{source}'.")
+                    return
+                self._choose_and_load_precomputed(candidates)
+            self.after(0, after_lookup)
+
+        self._run_bg(task)
+
+    def _choose_and_load_precomputed(self, candidates):
+        if len(candidates) == 1:
+            self._download_and_load_precomputed(candidates[0])
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Select Target Variant")
+        dlg.configure(bg=THEME["chassis"])
+        dlg.transient(self)
+        dlg.resizable(False, False)
+
+        ttk.Label(dlg, text="Multiple pre-computed variants found — pick one:").pack(
+            padx=20, pady=(16, 8))
+
+        listbox = tk.Listbox(
+            dlg, height=min(8, len(candidates)), width=50,
+            bg=THEME["panel"], fg=THEME["ink"],
+            selectbackground=THEME["accent"], selectforeground=THEME["chassis"],
+            highlightthickness=1, highlightbackground=THEME["line"],
+            borderwidth=0, activestyle="none", font=(self.font_ui, 10))
+        for c in candidates:
+            listbox.insert("end", c["label"])
+        listbox.selection_set(0)
+        listbox.pack(padx=20, pady=(0, 12), fill="both", expand=True)
+
+        row = ttk.Frame(dlg)
+        row.pack(pady=(0, 16))
+
+        def choose():
+            sel = listbox.curselection()
+            dlg.destroy()
+            if sel:
+                self._download_and_load_precomputed(candidates[sel[0]])
+
+        def cancel():
+            dlg.destroy()
+
+        ttk.Button(row, text="Cancel", command=cancel).pack(side="left", padx=4)
+        ttk.Button(row, text="Load", style="Accent.TButton", command=choose).pack(
+            side="left", padx=4)
+        listbox.bind("<Double-Button-1>", lambda _e: choose())
+
+        dlg.protocol("WM_DELETE_WINDOW", cancel)
+        dlg.grab_set()
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+    def _download_and_load_precomputed(self, candidate):
+        busy = self._show_busy_dialog(
+            "Pre-computed Profile", f"Downloading {candidate['label']}...")
+
+        def task():
+            try:
+                local_path = fetch_autoeq_remote_file(candidate["path"])
+                data = load_profile(local_path)
+            except Exception as e:
+                def fail():
+                    busy.destroy()
+                    messagebox.showerror(
+                        "Pre-computed Profile", f"Could not load profile:\n{e}")
+                self.after(0, fail)
+                return
+
+            def apply():
+                busy.destroy()
+                self._snapshot()
+                loaded = [
+                    {
+                        "type": f.get("type", "PK"),
+                        "freq": float(f["freq"]) or 1000.0,
+                        "gain": float(f["gain"]),
+                        "q": float(f["q"]) or 1.0,
+                    }
+                    for f in data["filters"]
+                    if not f.get("disabled", is_filter_disabled(
+                        f.get("type", "PK"), f["freq"], f["gain"], f["q"]))
+                ]
+                self.create_filters = dedupe_filters(loaded)
+                self.selected_filter = 0 if self.create_filters else -1
+                self.create_preamp_entry.delete(0, "end")
+                self.create_preamp_entry.insert(0, str(data["preamp"]))
+                self._refresh_create_tab()
+                self._load_selected_filter_into_editor()
+                self._log(f"Loaded pre-computed profile ({candidate['label']})\n")
+            self.after(0, apply)
+
+        self._run_bg(task)
 
     def _pick_autoeq_target(self, callback):
         """Ask flat vs. a target searched from AutoEQ's online library vs. a
@@ -2534,37 +2713,40 @@ class EqLoaderGUI(tk.Tk):
     def _pick_autoeq_model(self, callback):
         """Search a measurement database by model name, à la autoeq.app.
 
-        Eventually calls `callback(measurement_path_or_None)` — asynchronously
-        when fetching the online database, since that hits the network.
+        Eventually calls `callback(measurement_path_or_None, index_entry_or_None)`
+        — asynchronously when fetching the online database, since that hits
+        the network. `index_entry` is None for a manually browsed file, or
+        for a local-folder pick; only online-database picks carry one (used
+        to look up a pre-computed profile for the same model, if wanted).
         """
         if self._autoeq_model_index is not None:
-            callback(self._show_model_search_dialog())
+            callback(*self._show_model_search_dialog())
             return
 
         saved = load_autoeq_db_path()
         if saved == "online":
-            self._fetch_online_index(lambda: callback(self._show_model_search_dialog()))
+            self._fetch_online_index(lambda: callback(*self._show_model_search_dialog()))
             return
         if saved and os.path.isdir(saved):
             self._ensure_local_autoeq_index(saved)
-            callback(self._show_model_search_dialog())
+            callback(*self._show_model_search_dialog())
             return
 
         choice = self._prompt_for_autoeq_source()
         if choice is None:
-            callback(None)
+            callback(None, None)
             return
         if choice == "online":
-            self._fetch_online_index(lambda: callback(self._show_model_search_dialog()))
+            self._fetch_online_index(lambda: callback(*self._show_model_search_dialog()))
             return
 
         chosen = filedialog.askdirectory(title="Select Measurement Database Folder")
         if not chosen:
-            callback(None)
+            callback(None, None)
             return
         save_autoeq_db_path(chosen)
         self._ensure_local_autoeq_index(chosen)
-        callback(self._show_model_search_dialog())
+        callback(*self._show_model_search_dialog())
 
     def _prompt_for_autoeq_source(self):
         """Ask 'online database' vs 'local folder'. Returns 'online'/'local'/None."""
@@ -2652,7 +2834,7 @@ class EqLoaderGUI(tk.Tk):
         dlg.geometry("700x480")
         dlg.minsize(650, 360)
 
-        result = {"path": None}
+        result = {"path": None, "entry": None}
         filtered = []
 
         top = ttk.Frame(dlg)
@@ -2705,6 +2887,7 @@ class EqLoaderGUI(tk.Tk):
 
             if not entry_data.get("remote"):
                 result["path"] = entry_data["path"]
+                result["entry"] = entry_data
                 dlg.destroy()
                 return
 
@@ -2725,6 +2908,7 @@ class EqLoaderGUI(tk.Tk):
 
                 def done():
                     result["path"] = local_path
+                    result["entry"] = entry_data
                     dlg.destroy()
                 self.after(0, done)
 
@@ -2739,6 +2923,7 @@ class EqLoaderGUI(tk.Tk):
                 filetypes=[("Text/CSV files", "*.txt *.csv"), ("All files", "*.*")])
             if path:
                 result["path"] = path
+                result["entry"] = None
                 dlg.destroy()
 
         def change_db():
@@ -2787,7 +2972,7 @@ class EqLoaderGUI(tk.Tk):
         dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
         self.wait_window(dlg)
-        return result["path"]
+        return result["path"], result["entry"]
 
     # ------------------------------------------------------------------
     # Device discovery
