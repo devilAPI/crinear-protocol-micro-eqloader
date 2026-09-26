@@ -946,6 +946,7 @@ class EqLoaderGUI(tk.Tk):
         # Inputs.
         for widget in ("TEntry", "TSpinbox", "TCombobox"):
             style.configure(widget,
+                            background=c["input"],
                             fieldbackground=c["input"],
                             foreground=c["ink"],
                             insertcolor=c["accent"],
@@ -955,6 +956,22 @@ class EqLoaderGUI(tk.Tk):
             style.map(widget,
                       bordercolor=[("focus", c["accent"])],
                       foreground=[("disabled", c["muted"])])
+
+        # readonly combobox field needs explicit state mappings —
+        # style.configure values are overridden by the readonly state.
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", c["input"]),
+                                   ("disabled", c["panel"])],
+                  foreground=[("readonly", c["ink"]),
+                               ("disabled", c["muted"])],
+                  selectbackground=[("readonly", c["input"])],
+                  selectforeground=[("readonly", c["ink"])],
+                  background=[("focus",  c["input"]),
+                               ("active", c["line"]),
+                               ("!focus", c["input"])],
+                  arrowcolor=[("focus",  c["accent"]),
+                               ("active", c["accent"]),
+                               ("!focus", c["muted"])])
 
         # Buttons: quiet by default, cyan chassis-LED on hover.
         style.configure("TButton",
@@ -1027,6 +1044,13 @@ class EqLoaderGUI(tk.Tk):
                             arrowcolor=c["muted"])
             style.map(sb, background=[("active", c["line"])])
 
+        # Combobox dropdown popup is a plain tk.Listbox — style via option_add.
+        self.option_add("*TCombobox*Listbox.background",       c["input"])
+        self.option_add("*TCombobox*Listbox.foreground",       c["ink"])
+        self.option_add("*TCombobox*Listbox.selectBackground", c["accent"])
+        self.option_add("*TCombobox*Listbox.selectForeground", c["chassis"])
+        self.option_add("*TCombobox*Listbox.font",             (self.font_ui, 10))
+
     def _theme_classic_widgets(self):
         """Colour the non-ttk (classic tk) widgets to match the theme."""
 
@@ -1062,6 +1086,15 @@ class EqLoaderGUI(tk.Tk):
                 padx=8,
                 pady=6,
             )
+            self.log_text.vbar.configure(
+                bg=c["input"],
+                troughcolor=c["panel"],
+                activebackground=c["line"],
+                highlightbackground=c["panel"],
+                highlightcolor=c["panel"],
+                borderwidth=0,
+                relief="flat",
+            )
 
     # ------------------------------------------------------------------
     # Layout
@@ -1070,7 +1103,7 @@ class EqLoaderGUI(tk.Tk):
     def _build_widgets(self):
 
         self.grid_rowconfigure(2, weight=3)
-        self.grid_rowconfigure(3, weight=1)
+        self.grid_rowconfigure(5, weight=1)
         self.grid_columnconfigure(0, weight=1)
         self.grid_columnconfigure(1, weight=0)
 
@@ -1196,511 +1229,97 @@ class EqLoaderGUI(tk.Tk):
         )
 
         # --------------------------------------------------------------
-        # Main notebook
-        # --------------------------------------------------------------
-
-        nb = ttk.Notebook(self)
-        self.nb = nb
-
-        nb.grid(
-            row=2,
-            column=0,
-            sticky="nsew",
-            padx=(8, 4),
-            pady=6
-        )
-
-        # ==============================================================
-        # EQ TAB
-        # ==============================================================
-
-        eq_tab = ttk.Frame(nb)
-
-        nb.add(
-            eq_tab,
-            text="EQ"
-        )
-
-        # --------------------------------------------------------------
-        # EQ notebook inside EQ tab
-        # --------------------------------------------------------------
-
-        eq_notebook = ttk.Notebook(eq_tab)
-        self.eq_notebook = eq_notebook
-
-        eq_notebook.pack(
-            fill="both",
-            expand=True
-        )
-
-        # ==============================================================
-        # Profile tab
-        # ==============================================================
-
-        profile_tab = ttk.Frame(eq_notebook)
-
-        eq_notebook.add(
-            profile_tab,
-            text="Profile"
-        )
-
-        # --------------------------------------------------------------
-        # Pull section
-        # --------------------------------------------------------------
-
-        pull_frame = ttk.LabelFrame(
-            profile_tab,
-            text="Pull from Device"
-        )
-
-        pull_frame.pack(
-            fill="x",
-            padx=8,
-            pady=8
-        )
-
-        ttk.Label(
-            pull_frame,
-            text="Output file:"
-        ).grid(
-            row=0,
-            column=0,
-            sticky="w",
-            padx=4,
-            pady=4
-        )
-
-        self.pull_output_entry = ttk.Entry(
-            pull_frame,
-            width=55
-        )
-
-        self.pull_output_entry.insert(
-            0,
-            "pulled_profile.txt"
-        )
-
-        self.pull_output_entry.grid(
-            row=0,
-            column=1,
-            padx=4,
-            sticky="ew"
-        )
-
-        ttk.Button(
-            pull_frame,
-            text="Browse...",
-            command=self._browse_pull_output
-        ).grid(
-            row=0,
-            column=2,
-            padx=4
-        )
-
-        ttk.Label(
-            pull_frame,
-            text="Max filters:"
-        ).grid(
-            row=1,
-            column=0,
-            sticky="w",
-            padx=4,
-            pady=4
-        )
-
-        self.pull_maxfilters_spin = ttk.Spinbox(
-            pull_frame,
-            from_=1,
-            to=32,
-            width=6
-        )
-
-        self.pull_maxfilters_spin.set(
-            DEFAULT_MAX_FILTERS
-        )
-
-        self.pull_maxfilters_spin.grid(
-            row=1,
-            column=1,
-            sticky="w",
-            padx=4
-        )
-
-        ttk.Button(
-            pull_frame,
-            text="Pull from Device",
-            command=self._pull,
-            style="Accent.TButton"
-        ).grid(
-            row=2,
-            column=0,
-            columnspan=3,
-            pady=8
-        )
-
-        pull_frame.columnconfigure(
-            1,
-            weight=1
-        )
-
-        # --------------------------------------------------------------
-        # Push section
-        # --------------------------------------------------------------
-
-        push_frame = ttk.LabelFrame(
-            profile_tab,
-            text="Push Profile to Device"
-        )
-
-        push_frame.pack(
-            fill="x",
-            padx=8,
-            pady=8
-        )
-
-        ttk.Label(
-            push_frame,
-            text="Profile .txt:"
-        ).grid(
-            row=0,
-            column=0,
-            sticky="w",
-            padx=4,
-            pady=4
-        )
-
-        self.push_profile_entry = ttk.Entry(
-            push_frame,
-            width=55
-        )
-
-        self.push_profile_entry.grid(
-            row=0,
-            column=1,
-            padx=4,
-            sticky="ew"
-        )
-
-        ttk.Button(
-            push_frame,
-            text="Browse...",
-            command=self._browse_push_profile
-        ).grid(
-            row=0,
-            column=2,
-            padx=4
-        )
-
-        ttk.Label(
-            push_frame,
-            text="Slot:"
-        ).grid(
-            row=1,
-            column=0,
-            sticky="w",
-            padx=4,
-            pady=4
-        )
-
-        self.push_slot_spin = ttk.Spinbox(
-            push_frame,
-            from_=0,
-            to=15,
-            width=6
-        )
-
-        self.push_slot_spin.set(0)
-
-        self.push_slot_spin.grid(
-            row=1,
-            column=1,
-            sticky="w",
-            padx=4
-        )
-
-        ttk.Label(
-            push_frame,
-            text="Gain buffer (dB):"
-        ).grid(
-            row=2,
-            column=0,
-            sticky="w",
-            padx=4,
-            pady=4
-        )
-
-        self.push_buffer_entry = ttk.Entry(
-            push_frame,
-            width=8
-        )
-
-        self.push_buffer_entry.insert(
-            0,
-            fmt_num(
-                float(DEFAULT_GLOBAL_GAIN_BUFFER),
-                1
-            )
-        )
-
-        self.push_buffer_entry.grid(
-            row=2,
-            column=1,
-            sticky="w",
-            padx=4
-        )
-
-        self.push_no_write_gain = tk.BooleanVar(
-            value=False
-        )
-
-        ttk.Checkbutton(
-            push_frame,
-            text="Skip writing global gain register",
-            variable=self.push_no_write_gain
-        ).grid(
-            row=3,
-            column=0,
-            columnspan=2,
-            sticky="w",
-            padx=4
-        )
-
-        ttk.Button(
-            push_frame,
-            text="Push to Device",
-            command=self._push,
-            style="Accent.TButton"
-        ).grid(
-            row=4,
-            column=0,
-            columnspan=3,
-            pady=8
-        )
-
-        push_frame.columnconfigure(
-            1,
-            weight=1
-        )
-
-        # ==============================================================
-        # Create / Editor tab
-        # ==============================================================
-
-        create_tab = ttk.Frame(eq_notebook)
-
-        eq_notebook.add(
-            create_tab,
-            text="Editor"
-        )
-
-        # --------------------------------------------------------------
-        # Graph
+        # Graph  (row 2, col 0)
         # --------------------------------------------------------------
 
         self.fig = Figure(
             figsize=(7, 4),
             dpi=100,
             facecolor=THEME["chassis"],
+            layout="constrained",
         )
 
         self.ax = self.fig.add_subplot(111)
         self.ax.set_facecolor(THEME["panel"])
 
-        self.canvas_graph = FigureCanvasTkAgg(
-            self.fig,
-            master=create_tab
-        )
-
-        create_tab.rowconfigure(0, weight=1)
-        create_tab.columnconfigure(0, weight=1)
-
-        # Connect the click and drag events
-        self.canvas_graph.mpl_connect("button_press_event", self._on_press)
-        self.canvas_graph.mpl_connect("motion_notify_event", self._on_motion)
-        self.canvas_graph.mpl_connect("button_release_event", self._on_release)
-        self.canvas_graph.get_tk_widget().grid(
-            row=0,
+        # Container frame: grid_propagate(False) stops the canvas's own
+        # size requests from forcing a main-window geometry recalculation
+        # when matplotlib redraws on click.
+        graph_frame = tk.Frame(self, bg=THEME["chassis"])
+        graph_frame.grid(
+            row=2,
             column=0,
             sticky="nsew",
-            padx=5,
-            pady=5
+            padx=(8, 4),
+            pady=(6, 2),
         )
+        graph_frame.grid_propagate(False)
+
+        self.canvas_graph = FigureCanvasTkAgg(self.fig, master=graph_frame)
+
+        self.canvas_graph.mpl_connect("button_press_event",   self._on_press)
+        self.canvas_graph.mpl_connect("motion_notify_event",  self._on_motion)
+        self.canvas_graph.mpl_connect("button_release_event", self._on_release)
+        self.canvas_graph.get_tk_widget().pack(fill="both", expand=True)
 
         # --------------------------------------------------------------
-        # Editor controls
+        # Filter list + editor  (row 3, col 0)
         # --------------------------------------------------------------
 
-        ctrl = ttk.Frame(create_tab)
+        ctrl = ttk.Frame(self)
 
         ctrl.grid(
-            row=1,
+            row=3,
             column=0,
-            sticky="nsew",
-            padx=6,
-            pady=6
+            sticky="ew",
+            padx=(8, 4),
+            pady=2,
         )
 
         ctrl.columnconfigure(1, weight=1)
 
-        # Filter list
+        list_frame = ttk.LabelFrame(ctrl, text="Filters")
 
-        list_frame = ttk.LabelFrame(
-            ctrl,
-            text="Filters"
-        )
+        list_frame.grid(row=0, column=0, sticky="ns")
 
-        list_frame.grid(
-            row=0,
-            column=0,
-            sticky="ns"
-        )
+        self.filter_list = tk.Listbox(list_frame, height=7)
 
-        self.filter_list = tk.Listbox(
-            list_frame,
-            height=9,
-        )
+        self.filter_list.pack(fill="both", expand=True, padx=5, pady=5)
 
-        self.filter_list.pack(
-            fill="both",
-            expand=True,
-            padx=5,
-            pady=5
-        )
+        self.filter_list.bind("<<ListboxSelect>>", self._create_select_band)
 
-        self.filter_list.bind(
-            "<<ListboxSelect>>",
-            self._create_select_band
-        )
+        edit = ttk.LabelFrame(ctrl, text="Selected Filter")
 
-        # Editor
-
-        edit = ttk.LabelFrame(
-            ctrl,
-            text="Selected Filter"
-        )
-
-        edit.grid(
-            row=0,
-            column=1,
-            sticky="nsew",
-            padx=10
-        )
+        edit.grid(row=0, column=1, sticky="nsew", padx=10)
 
         edit.columnconfigure(1, weight=1)
 
-        ttk.Label(
-            edit,
-            text="Frequency (Hz)"
-        ).grid(
-            row=0,
-            column=0,
-            sticky="w",
-            padx=5,
-            pady=4
+        for row_i, (lbl, var_name, default) in enumerate((
+            ("Frequency (Hz)", "freq_var", "1000"),
+            ("Gain (dB)",      "gain_var", "0"),
+            ("Q",              "q_var",    "1.0"),
+        )):
+            lbl_widget = ttk.Label(edit, text=lbl)
+            lbl_widget.grid(row=row_i, column=0, sticky="w", padx=5, pady=3)
+            if var_name == "q_var":
+                self.q_label = lbl_widget
+            setattr(self, var_name, tk.StringVar(value=default))
+            ttk.Entry(edit, textvariable=getattr(self, var_name)).grid(
+                row=row_i, column=1, sticky="ew", padx=5, pady=3
+            )
+
+        ttk.Label(edit, text="Type").grid(
+            row=3, column=0, sticky="w", padx=5, pady=3
         )
 
-        self.freq_var = tk.StringVar(
-            value="1000"
-        )
-
-        ttk.Entry(
-            edit,
-            textvariable=self.freq_var,
-        ).grid(
-            row=0,
-            column=1,
-            sticky="ew",
-            padx=5,
-            pady=4
-        )
-
-        ttk.Label(
-            edit,
-            text="Gain (dB)"
-        ).grid(
-            row=1,
-            column=0,
-            sticky="w",
-            padx=5,
-            pady=4
-        )
-
-        self.gain_var = tk.StringVar(
-            value="0"
-        )
-
-        ttk.Entry(
-            edit,
-            textvariable=self.gain_var,
-        ).grid(
-            row=1,
-            column=1,
-            sticky="ew",
-            padx=5,
-            pady=4
-        )
-
-        self.q_label = ttk.Label(
-            edit,
-            text="Q"
-        )
-
-        self.q_label.grid(
-            row=2,
-            column=0,
-            sticky="w",
-            padx=5,
-            pady=4
-        )
-
-        self.q_var = tk.StringVar(
-            value="1.0"
-        )
-
-        ttk.Entry(
-            edit,
-            textvariable=self.q_var,
-        ).grid(
-            row=2,
-            column=1,
-            sticky="ew",
-            padx=5,
-            pady=4
-        )
-
-        ttk.Label(
-            edit,
-            text="Type"
-        ).grid(
-            row=3,
-            column=0,
-            sticky="w",
-            padx=5,
-            pady=4
-        )
-
-        self.type_var = tk.StringVar(
-            value="PK"
-        )
+        self.type_var = tk.StringVar(value="PK")
 
         ttk.Combobox(
             edit,
             textvariable=self.type_var,
-            values=[
-                "PK",
-                "LSQ",
-                "HSQ",
-                "LP",
-                "HP",
-            ],
-            state="readonly"
-        ).grid(
-            row=3,
-            column=1,
-            sticky="ew",
-            padx=5,
-            pady=4
-        )
+            values=["PK", "LSQ", "HSQ", "LP", "HP"],
+            state="readonly",
+        ).grid(row=3, column=1, sticky="ew", padx=5, pady=3)
 
         self.bw_mode = tk.BooleanVar(value=False)
 
@@ -1709,208 +1328,102 @@ class EqLoaderGUI(tk.Tk):
             text="Show as Bandwidth (oct)",
             variable=self.bw_mode,
             command=self._toggle_bw_mode,
-        ).grid(
+        ).grid(row=4, column=0, columnspan=2, sticky="w", padx=5, pady=2)
+
+        # --------------------------------------------------------------
+        # Operations bar  (row 4, col 0)
+        # Four compact sub-sections in a 2×2 grid
+        # --------------------------------------------------------------
+
+        ops = ttk.Frame(self)
+
+        ops.grid(
             row=4,
             column=0,
-            columnspan=2,
-            sticky="w",
-            padx=5,
+            sticky="ew",
+            padx=(8, 4),
             pady=2,
         )
 
+        ops.columnconfigure(0, weight=1)
+        ops.columnconfigure(1, weight=1)
 
-        # --------------------------------------------------------------
-        # Created EQ push controls
-        # --------------------------------------------------------------
+        # -- Created EQ params (0,0) --
 
-        push_created_frame = ttk.LabelFrame(
-            create_tab,
-            text="Created EQ"
-        )
+        push_created_frame = ttk.LabelFrame(ops, text="EQ")
 
-        push_created_frame.grid(
-            row=2,
-            column=0,
-            sticky="ew",
-            padx=6,
-            pady=6
-        )
+        push_created_frame.grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=2)
 
-        ttk.Label(
-            push_created_frame,
-            text="Slot:"
-        ).pack(
-            side="left",
-            padx=(8, 4)
-        )
-
-        self.create_slot_spin = ttk.Spinbox(
-            push_created_frame,
-            from_=0,
-            to=15,
-            width=6
-        )
-
-        self.create_slot_spin.set(0)
-
-        self.create_slot_spin.pack(
-            side="left",
-            padx=4
-        )
-
-        ttk.Label(
-            push_created_frame,
-            text="Preamp (dB):"
-        ).pack(
-            side="left",
-            padx=(15, 4)
-        )
-
-        self.create_preamp_entry = ttk.Entry(
-            push_created_frame,
-            width=8
-        )
-
-        self.create_preamp_entry.insert(
-            0,
-            "0"
-        )
-
-        self.create_preamp_entry.pack(
-            side="left",
-            padx=4
-        )
-
-        ttk.Label(
-            push_created_frame,
-            text="Buffer (dB):"
-        ).pack(
-            side="left",
-            padx=(15, 4)
-        )
-
-        self.create_buffer_entry = ttk.Entry(
-            push_created_frame,
-            width=8
-        )
-
-        self.create_buffer_entry.insert(
-            0,
-            fmt_num(
-                float(DEFAULT_GLOBAL_GAIN_BUFFER),
-                1
+        for lbl, attr, default in (
+            ("Slot",        "create_slot_spin",   None),
+            ("Preamp (dB)", "create_preamp_entry", "0"),
+            ("Buffer (dB)", "create_buffer_entry",
+             fmt_num(float(DEFAULT_GLOBAL_GAIN_BUFFER), 1)),
+        ):
+            ttk.Label(push_created_frame, text=f"{lbl}:").pack(
+                side="left", padx=(8, 2)
             )
-        )
+            if lbl == "Slot":
+                w = ttk.Spinbox(push_created_frame, from_=0, to=15, width=5)
+                w.set(0)
+            else:
+                w = ttk.Entry(push_created_frame, width=7)
+                w.insert(0, default)
+            w.pack(side="left", padx=(0, 6))
+            setattr(self, attr, w)
 
-        self.create_buffer_entry.pack(
-            side="left",
-            padx=4
-        )
+        # -- Enable / Disable PEQ (0,1) --
 
+        ed_frame = ttk.LabelFrame(ops, text="PEQ Enable / Disable")
 
-        # --------------------------------------------------------------
-        # Enable / Disable
-        # --------------------------------------------------------------
+        ed_frame.grid(row=0, column=1, sticky="ew", padx=(4, 0), pady=2)
 
-        ed_tab = ttk.Frame(nb)
+        ttk.Label(ed_frame, text="Slot:").pack(side="left", padx=(8, 2))
 
-        nb.add(
-            ed_tab,
-            text="Enable / Disable"
-        )
-
-        ttk.Label(
-            ed_tab,
-            text="Slot:"
-        ).grid(
-            row=0,
-            column=0,
-            sticky="w",
-            padx=4,
-            pady=4
-        )
-
-        self.ed_slot_spin = ttk.Spinbox(
-            ed_tab,
-            from_=0,
-            to=15,
-            width=6
-        )
-
+        self.ed_slot_spin = ttk.Spinbox(ed_frame, from_=0, to=15, width=5)
         self.ed_slot_spin.set(0)
-
-        self.ed_slot_spin.grid(
-            row=0,
-            column=1,
-            sticky="w",
-            padx=4
-        )
+        self.ed_slot_spin.pack(side="left", padx=(0, 8))
 
         ttk.Button(
-            ed_tab,
-            text="Enable PEQ",
-            command=self._enable,
-            style="Accent.TButton"
-        ).grid(
-            row=1,
-            column=0,
-            pady=8,
-            padx=4
-        )
+            ed_frame, text="Enable PEQ",
+            command=self._enable, style="Accent.TButton",
+        ).pack(side="left", padx=4, pady=4)
 
         ttk.Button(
-            ed_tab,
-            text="Disable PEQ",
-            command=self._disable,
-            style="Danger.TButton"
-        ).grid(
-            row=1,
-            column=1,
-            pady=8,
-            padx=4
-        )
+            ed_frame, text="Disable PEQ",
+            command=self._disable, style="Danger.TButton",
+        ).pack(side="left", padx=4, pady=4)
 
         # --------------------------------------------------------------
-        # Log
+        # Log  (row 5, col 0)
         # --------------------------------------------------------------
 
-        log_frame = ttk.LabelFrame(
-            self,
-            text="Log"
-        )
+        log_frame = ttk.LabelFrame(self, text="Log")
 
         log_frame.grid(
-            row=3,
+            row=5,
             column=0,
             sticky="nsew",
             padx=(8, 4),
-            pady=6
+            pady=6,
         )
 
         self.log_text = scrolledtext.ScrolledText(
-            log_frame,
-            height=5,
-            state="disabled"
+            log_frame, height=5, state="disabled"
         )
 
-        self.log_text.pack(
-            fill="both",
-            expand=True,
-            padx=4,
-            pady=4
-        )
+        self.log_text.pack(fill="both", expand=True, padx=4, pady=4)
 
         # --------------------------------------------------------------
-        # Actions panel — main window column 1, spans notebook + log
+        # Actions panel  (col 1, rows 2–5)
         # --------------------------------------------------------------
 
         actions = ttk.LabelFrame(self, text="Actions")
-        self.actions = actions
 
         actions.grid(
             row=2,
             column=1,
-            rowspan=2,
+            rowspan=4,
             sticky="nsew",
             padx=(0, 8),
             pady=6,
@@ -1919,30 +1432,21 @@ class EqLoaderGUI(tk.Tk):
         actions.columnconfigure(0, weight=1)
 
         _action_btns = (
-            ("Apply",            self._create_apply,            "Accent.TButton"),
+            ("Reload Graph",            self._create_apply,            "Accent.TButton"),
             ("Add Band",         self._create_add_band,         "TButton"),
             ("Delete Band",      self._create_delete_band,      "Danger.TButton"),
             ("Delete All",       self._create_delete_all_bands, "Danger.TButton"),
-            ("Load from Device", self._create_load_from_device, "TButton"),
-            ("Save Profile",     self._create_save_profile,     "TButton"),
-            ("Load Profile",     self._create_load_profile,     "TButton"),
-            ("Push Created EQ",  self._create_push,             "Accent.TButton"),
+            ("Load EQ from Device", self._create_load_from_device, "TButton"),
+            ("Save Profile to File",     self._create_save_profile,     "TButton"),
+            ("Load Profile from File",     self._create_load_profile,     "TButton"),
+            ("Push EQ to Device",  self._create_push,             "Accent.TButton"),
         )
 
         for i, (text, cmd, style) in enumerate(_action_btns):
             actions.rowconfigure(i, weight=1)
             ttk.Button(
-                actions,
-                text=text,
-                command=cmd,
-                style=style,
-            ).grid(
-                row=i,
-                column=0,
-                sticky="nsew",
-                padx=6,
-                pady=2,
-            )
+                actions, text=text, command=cmd, style=style,
+            ).grid(row=i, column=0, sticky="nsew", padx=6, pady=2)
 
         # --------------------------------------------------------------
         # Initial state
@@ -1952,30 +1456,9 @@ class EqLoaderGUI(tk.Tk):
         self.bind("<Control-y>", self._redo)
         self.bind("<Control-Shift-z>", self._redo)
 
-        nb.bind("<<NotebookTabChanged>>", self._on_tab_change)
-        eq_notebook.bind("<<NotebookTabChanged>>", self._on_tab_change)
-
         self._refresh_create_tab()
 
         self._refresh_devices()
-
-        self._on_tab_change()
-
-    # ==================================================================
-    # Tab visibility
-    # ==================================================================
-
-    def _on_tab_change(self, _event=None):
-        try:
-            on_eq_tab = self.nb.index(self.nb.select()) == 0
-            on_editor = self.eq_notebook.index(self.eq_notebook.select()) == 1
-        except Exception:
-            on_eq_tab = on_editor = False
-
-        if on_eq_tab and on_editor:
-            self.actions.grid()
-        else:
-            self.actions.grid_remove()
 
     # ==================================================================
     # Create / Editor
@@ -2176,7 +1659,6 @@ class EqLoaderGUI(tk.Tk):
         self.ax.set_xlabel("Frequency (Hz)", color=c["muted"], fontsize=9)
         self.ax.set_ylabel("Gain (dB)", color=c["muted"], fontsize=9)
 
-        self.fig.tight_layout()
         self.canvas_graph.draw_idle()
 
     def _create_add_band(self):
@@ -2245,7 +1727,7 @@ class EqLoaderGUI(tk.Tk):
     def _create_load_from_device(self):
 
         if not messagebox.askyesno(
-            "Load from Device",
+            "Load EQ from Device",
             "Load EQ from device? This will replace all current filters."
         ):
             return
@@ -3047,177 +2529,6 @@ class EqLoaderGUI(tk.Tk):
 
             try:
                 get_current_slot(dev)
-
-            finally:
-                dev.close()
-
-        self._run_bg(task)
-
-    # ==================================================================
-    # Pull
-    # ==================================================================
-
-    def _browse_pull_output(self):
-
-        path = filedialog.asksaveasfilename(
-            defaultextension=".txt",
-            filetypes=[
-                ("Text files", "*.txt")
-            ]
-        )
-
-        if path:
-
-            self.pull_output_entry.delete(
-                0,
-                "end"
-            )
-
-            self.pull_output_entry.insert(
-                0,
-                path
-            )
-
-    def _pull(self):
-
-        output = (
-            self.pull_output_entry
-            .get()
-            .strip()
-        )
-
-        max_filters = self._parse_int(
-            self.pull_maxfilters_spin.get(),
-            DEFAULT_MAX_FILTERS
-        )
-
-        if not output:
-
-            messagebox.showwarning(
-                "Missing output",
-                "Choose an output file first."
-            )
-
-            return
-
-        def task():
-
-            dev = self._open_selected_device()
-
-            try:
-
-                slot = get_current_slot(
-                    dev
-                )
-
-                result = pull_from_device(
-                    dev,
-                    max_filters=max_filters,
-                    slot_hint=slot
-                )
-
-                save_profile(
-                    output,
-                    result["globalGain"],
-                    result["filters"]
-                )
-
-                print(
-                    f"Saved "
-                    f"{len(result['filters'])} "
-                    f"filter(s) to {output}"
-                )
-
-            finally:
-                dev.close()
-
-        self._run_bg(task)
-
-    # ==================================================================
-    # Push
-    # ==================================================================
-
-    def _browse_push_profile(self):
-
-        path = filedialog.askopenfilename(
-            filetypes=[
-                ("Text files", "*.txt"),
-                ("All files", "*.*"),
-            ]
-        )
-
-        if path:
-
-            self.push_profile_entry.delete(
-                0,
-                "end"
-            )
-
-            self.push_profile_entry.insert(
-                0,
-                path
-            )
-
-    def _push(self):
-
-        profile_path = (
-            self.push_profile_entry
-            .get()
-            .strip()
-        )
-
-        if not profile_path:
-
-            messagebox.showwarning(
-                "Missing profile",
-                "Choose a profile .txt file first."
-            )
-
-            return
-
-        slot = self._parse_int(
-            self.push_slot_spin.get(),
-            0
-        )
-
-        buffer_db = self._parse_float(
-            self.push_buffer_entry.get(),
-            DEFAULT_GLOBAL_GAIN_BUFFER
-        )
-
-        write_gain = (
-            not self.push_no_write_gain.get()
-        )
-
-        def task():
-
-            profile = load_profile(
-                profile_path
-            )
-
-            dev = self._open_selected_device()
-
-            try:
-
-                push_to_device(
-                    dev,
-                    slot,
-                    profile["preamp"],
-                    profile["filters"],
-                    buffer_db=buffer_db,
-                    write_gain=write_gain
-                )
-
-                enable_peq(
-                    dev,
-                    True,
-                    slot_id=slot
-                )
-
-                print(
-                    f"Profile pushed and PEQ "
-                    f"enabled on slot {slot}"
-                )
 
             finally:
                 dev.close()
