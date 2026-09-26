@@ -155,11 +155,12 @@ python3 eqloader.py push my_eq.txt --slot 1 --buffer 3.5
 python3 eqloader.py pull <file> [options]
 ```
 
-Reads the active EQ from the dongle and saves it as a `.txt` profile.
+Reads the active EQ from the dongle and saves it as a `.txt` profile, including the preamp (the device's gain register plus the hardware buffer — whole dB only, and never above the buffer, since that's all the device stores).
 
 | Option | Default | Description |
 |---|---|---|
 | `--max-filters N` | `8` | Maximum number of bands to read |
+| `--buffer DB` | `-5` | Hardware gain buffer in dB, added back to the device's gain register to get the saved preamp |
 | `--vid HEX` | `0x3302` | Override vendor ID |
 | `--pid HEX` | auto | Target a specific product ID |
 

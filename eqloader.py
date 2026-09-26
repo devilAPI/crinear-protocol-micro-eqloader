@@ -243,6 +243,21 @@ def read_global_gain(dev):
     return raw - 256 if raw > 127 else raw
 
 
+def preamp_to_register(preamp, buffer_db=DEFAULT_GLOBAL_GAIN_BUFFER):
+    """Gain register value (whole dB, <= 0) for `preamp`.
+
+    The device already attenuates by the fixed `buffer_db` (-5 dB on the
+    Protocol Micro); the register only holds attenuation beyond that.
+    """
+    return round(min(0, preamp - buffer_db))
+
+
+def register_to_preamp(register, buffer_db=DEFAULT_GLOBAL_GAIN_BUFFER):
+    """Effective preamp the device applies for a gain register value (inverse
+    of preamp_to_register, up to its whole-dB rounding and buffer clamp)."""
+    return register + buffer_db
+
+
 def push_to_device(dev, slot, global_gain, filters,
                    buffer_db=DEFAULT_GLOBAL_GAIN_BUFFER, write_gain=True):
     """Write `filters` to `slot`, set the gain register, and flash."""
@@ -253,7 +268,7 @@ def push_to_device(dev, slot, global_gain, filters,
     time.sleep(0.1)
 
     if write_gain:
-        gain_to_write = round(min(0, global_gain - buffer_db))
+        gain_to_write = preamp_to_register(global_gain, buffer_db)
         write_global_gain(dev, gain_to_write)
         print(
             f"Set global gain register to {gain_to_write} dB "
@@ -273,10 +288,12 @@ def push_to_device(dev, slot, global_gain, filters,
     print(f"Pushed {len(filters)} filter(s) to slot {slot} and flashed to device.")
 
 
-def pull_from_device(dev, max_filters, slot_hint=-1, timeout=10.0):
+def pull_from_device(dev, max_filters, slot_hint=-1, timeout=10.0,
+                     buffer_db=DEFAULT_GLOBAL_GAIN_BUFFER):
     """Read `max_filters` bands and the gain register.
 
-    Returns {"currentSlot", "globalGain", "filters"}; filters are
+    Returns {"currentSlot", "globalGain" (raw register), "preamp" (effective
+    preamp in dB, see register_to_preamp), "filters"}; filters are
     parse_filter_packet() dicts ordered by band index.
     """
     for i in range(max_filters):
@@ -298,11 +315,14 @@ def pull_from_device(dev, max_filters, slot_hint=-1, timeout=10.0):
 
     try:
         global_gain = read_global_gain(dev)
+        preamp = register_to_preamp(global_gain, buffer_db)
+        print(f"Global gain register {global_gain} dB -> preamp {preamp} dB "
+              f"(hardware buffer {buffer_db} dB)")
     except TimeoutError:
-        print("Warning: could not read global gain.")
-        global_gain = 0
+        print("Warning: could not read global gain; assuming preamp 0 dB.")
+        global_gain, preamp = 0, 0.0
 
-    return {"currentSlot": slot_hint, "globalGain": global_gain,
+    return {"currentSlot": slot_hint, "globalGain": global_gain, "preamp": preamp,
             "filters": [filters[i] for i in sorted(filters)]}
 
 
@@ -2552,9 +2572,11 @@ class EqLoaderGUI(tk.Tk):
                 "Load EQ from device? This will replace all current filters."):
             return
         max_filters = self.max_filters()
+        buffer_db = parse_float(self.buffer_spin.get(), DEFAULT_GLOBAL_GAIN_BUFFER)
         self._with_device(
-            lambda dev: pull_from_device(dev, max_filters, slot_hint=get_current_slot(dev)),
-            lambda result: self.set_filters(result["filters"], result["globalGain"]))
+            lambda dev: pull_from_device(dev, max_filters, slot_hint=get_current_slot(dev),
+                                         buffer_db=buffer_db),
+            lambda result: self.set_filters(result["filters"], result["preamp"]))
 
     def _push(self, then=None):
         """Push the EQ; `then()` runs only after a successful push."""
@@ -2679,8 +2701,9 @@ def _cli_push(args):
 
 def _cli_pull(args):
     with device_session(args.vid, args.pid) as dev:
-        result = pull_from_device(dev, args.max_filters, slot_hint=get_current_slot(dev))
-    save_profile(args.file, result["globalGain"], result["filters"])
+        result = pull_from_device(dev, args.max_filters, slot_hint=get_current_slot(dev),
+                                  buffer_db=args.buffer)
+    save_profile(args.file, result["preamp"], result["filters"])
     print(f"Saved {len(result['filters'])} filter(s) to {args.file}")
 
 
@@ -2703,6 +2726,9 @@ def _build_parser():
     sub = p.add_subparsers(dest="cmd")
 
     def add_device_args(parser):
+        parser.add_argument("--buffer", type=float, default=DEFAULT_GLOBAL_GAIN_BUFFER,
+                            help=f"Hardware gain buffer in dB "
+                                 f"(default: {DEFAULT_GLOBAL_GAIN_BUFFER})")
         parser.add_argument("--max-filters", type=int, default=DEFAULT_MAX_FILTERS,
                             help=f"Number of filter slots on the device "
                                  f"(default: {DEFAULT_MAX_FILTERS})")
@@ -2714,8 +2740,6 @@ def _build_parser():
     pp = sub.add_parser("push", help="Push a .txt profile to the device")
     pp.add_argument("file", help="Profile .txt file to push")
     pp.add_argument("--slot", type=int, default=0, help="Target PEQ slot (default: 0)")
-    pp.add_argument("--buffer", type=float, default=DEFAULT_GLOBAL_GAIN_BUFFER,
-                    help=f"Hardware gain buffer in dB (default: {DEFAULT_GLOBAL_GAIN_BUFFER})")
     pp.add_argument("--no-gain", action="store_true",
                     help="Skip writing the global gain register")
     pp.add_argument("--no-enable", action="store_true",
