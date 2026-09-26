@@ -51,15 +51,14 @@ The frequency-response graph is shown by default and hides automatically when th
 4. Add as many bands as the device supports (default: 8). Use **Delete Band** or right-click a handle on the graph to remove one.
 5. Set **Slot**, **Preamp**, and **Buffer** in the Created EQ row, then click **Push Created EQ** in the Actions panel.
 
-**Editing multiple bands at once:** Ctrl-click or Shift-click in the **Filters** list to select several bands. Changing a field in the **Selected Filter** panel applies that field to update readme with the new features that are important enugh to bethere
-every selected band, and **Delete Band** removes them all.
+**Editing multiple bands at once:** Ctrl-click or Shift-click in the **Filters** list to select several bands. Changing a field in the **Selected Filter** panel applies that field to every selected band, and **Delete Band** removes them all.
 
 ### AutoEQ — generate an EQ from your headphone model
 
 1. Click **AutoEQ** (Ctrl+Shift+A).
 2. The first time, choose **Download Online Database** to fetch the public [AutoEq](https://github.com/jaakkopasanen/AutoEq) measurement database from GitHub, or **Choose Local Folder...** to point at your own folder of measurement `.txt`/`.csv` files. This choice is remembered for next time.
 3. In the search popup, type your headphone or IEM model name and pick the right entry (multiple measurement sources per model are labeled by their subfolder, e.g. `oratory1990` vs `Crinacle`). Online entries download on selection and are cached locally, so picking the same model again is instant. Use **Browse File Instead...** for a one-off local file, or **Change Database...** to switch source.
-4. Choose whether to target a flat (0 dB) response or load your own target curve file.
+4. Pick a target curve: flat (0 dB), search AutoEQ's own online target library (Harman, diffuse-field, and more — fetched and cached the same way as measurements), or load your own target curve file.
 5. The optimizer runs in the background (a progress dialog shows while it works — this can take up to a minute) and fills in the filter bands plus a clip-safe preamp automatically. Review and tweak as usual, then push.
 
 ### Loading an existing profile

@@ -508,6 +508,7 @@ AUTOEQ_GITHUB_API_BASE = f"https://api.github.com/repos/{AUTOEQ_GITHUB_REPO}"
 AUTOEQ_GITHUB_RAW_BASE = (
     f"https://raw.githubusercontent.com/{AUTOEQ_GITHUB_REPO}/{AUTOEQ_GITHUB_BRANCH}/")
 AUTOEQ_MEASUREMENTS_DIR = "measurements"
+AUTOEQ_TARGETS_DIR = "targets"
 
 # Result files, not raw measurements — skip these when indexing a local folder
 # (a local clone may point at results/ instead of measurements/).
@@ -565,30 +566,34 @@ def _autoeq_github_get(url):
         return json.load(resp)
 
 
+def _autoeq_github_subtree(dir_name):
+    """Fetch just one top-level folder's subtree (by its own tree sha) rather
+    than the whole repo's recursive tree, which is large enough to get
+    truncated by GitHub's API before reaching every file."""
+    root = _autoeq_github_get(f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{AUTOEQ_GITHUB_BRANCH}")
+    dir_entry = next(
+        (e for e in root.get("tree", [])
+         if e.get("path") == dir_name and e.get("type") == "tree"),
+        None)
+    if dir_entry is None:
+        raise RuntimeError(f"'{dir_name}' folder not found in repo")
+
+    sub = _autoeq_github_get(
+        f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{dir_entry['sha']}?recursive=1")
+    if sub.get("truncated"):
+        print(f"Warning: GitHub '{dir_name}' listing was truncated; some entries may be missing.")
+    return sub.get("tree", [])
+
+
 def fetch_autoeq_online_index():
     """Query the AutoEQ GitHub repo for its list of raw measurement files.
 
     Only lists file names/paths (two small API calls); the actual
-    measurement content is downloaded lazily, on selection. Fetches just the
-    measurements/ subtree (by its own tree sha) rather than the whole repo's
-    recursive tree, since the latter is large enough to get truncated by
-    GitHub's API before reaching every model.
+    measurement content is downloaded lazily, on selection.
     """
-    root = _autoeq_github_get(f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{AUTOEQ_GITHUB_BRANCH}")
-    meas_entry = next(
-        (e for e in root.get("tree", [])
-         if e.get("path") == AUTOEQ_MEASUREMENTS_DIR and e.get("type") == "tree"),
-        None)
-    if meas_entry is None:
-        raise RuntimeError(f"'{AUTOEQ_MEASUREMENTS_DIR}' folder not found in repo")
-
-    sub = _autoeq_github_get(
-        f"{AUTOEQ_GITHUB_API_BASE}/git/trees/{meas_entry['sha']}?recursive=1")
-    if sub.get("truncated"):
-        print("Warning: GitHub file listing was truncated; some models may be missing.")
-
+    tree = _autoeq_github_subtree(AUTOEQ_MEASUREMENTS_DIR)
     index = []
-    for entry in sub.get("tree", []):
+    for entry in tree:
         path = entry.get("path", "")
         if entry.get("type") != "blob" or "/data/" not in path or not path.endswith(".csv"):
             continue
@@ -597,6 +602,29 @@ def fetch_autoeq_online_index():
             "label": Path(path).stem,
             "path": repo_path,  # repo-relative path; used as both remote key and cache key
             "subtitle": str(Path(path).parent),
+            "remote": True,
+        })
+    index.sort(key=lambda e: e["label"].lower())
+    return index
+
+
+def fetch_autoeq_targets_index():
+    """Query the AutoEQ GitHub repo for its list of named target curves
+    (Harman, diffuse-field, etc.) under targets/ — the same target library
+    hangout.audio's AutoEQ tool picks from, though not necessarily the exact
+    same tilt/adjustment it applies on top.
+    """
+    tree = _autoeq_github_subtree(AUTOEQ_TARGETS_DIR)
+    index = []
+    for entry in tree:
+        path = entry.get("path", "")
+        if entry.get("type") != "blob" or not path.endswith(".csv"):
+            continue
+        repo_path = f"{AUTOEQ_TARGETS_DIR}/{path}"
+        index.append({
+            "label": Path(path).stem,
+            "path": repo_path,
+            "subtitle": "",
             "remote": True,
         })
     index.sort(key=lambda e: e["label"].lower())
@@ -938,6 +966,158 @@ def autoeq_run(fr, fr_target, max_filters):
     return autoeq_strip(all_filters)
 
 
+# ---------------------------------------------------------------------------
+# ISO 226:2003 equal-loudness normalization (port of hangout.audio's
+# graphtool.js normalizePhone()/find_offset()/init_normalize()).
+#
+# hangout.audio (Crinacle's AutoEQ tool, a CrinGraph fork) doesn't feed raw
+# measurement/target dB values straight into Equalizer.autoeq() the way the
+# plain autoeq.app tool does — it first computes, independently for each
+# curve, the dB offset that brings it to a fixed equal-loudness reference
+# (0 phon by default), and adds that offset before running the optimizer.
+# Skipping this step is a real source of divergence from hangout.audio's
+# output: without it, two curves that each use a different absolute dB
+# reference convention (as different measurement sources/rigs do) get
+# compared directly, which can make the optimizer chase a systematic level
+# offset instead of the actual shape difference. Applying it here makes the
+# AutoEQ pipeline reference-convention-agnostic, matching the site's logic.
+# ---------------------------------------------------------------------------
+
+_ISO226_F = [
+    20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160,
+    200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600,
+    2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500,
+]
+
+_ISO226_A_F = [
+    0.532, 0.506, 0.48, 0.455, 0.432, 0.409, 0.387, 0.367, 0.349, 0.33,
+    0.315, 0.301, 0.288, 0.276, 0.267, 0.259, 0.253, 0.25, 0.246, 0.244,
+    0.243, 0.243, 0.243, 0.242, 0.242, 0.245, 0.254, 0.271, 0.301,
+]
+
+_ISO226_L_U = [
+    -31.6, -27.2, -23, -19.1, -15.9, -13, -10.3, -8.1, -6.2, -4.5,
+    -3.1, -2, -1.1, -0.4, 0, 0.3, 0.5, 0, -2.7, -4.1,
+    -1, 1.7, 2.5, 1.2, -2.1, -7.1, -11.2, -10.7, -3.1,
+]
+
+_ISO226_T_F = [
+    78.5, 68.7, 59.5, 51.1, 44, 37.5, 31.5, 26.5, 22.1, 17.9,
+    14.4, 11.4, 8.6, 6.2, 4.4, 3, 2.2, 2.4, 3.5, 1.7,
+    -1.3, -4.2, -6, -5.4, -1.5, 6, 12.6, 13.9, 12.3,
+]
+
+# Diffuse-field correction curve, ~1/48 octave from 19.4806 Hz, as used by
+# hangout.audio's init_normalize() (raw values, before the "-7" dB shift).
+_FREE_FIELD_RAW = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0725, 0.1, 0.1,
+    0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+    0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+    0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+    0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+    0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+    0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+    0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+    0.1, 0.0896, 0, 0, 0, 0, 0, 0.1, 0.1, 0.1, 0.1, 0.1,
+    0.1, 0.1, 0.1, 0.1, 0.1, 0.0967, 0, 0, 0, 0, 0, 0,
+    0, 0.0886, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.0656, 0, 0,
+    0, 0, 0, 0.024, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1,
+    0.045, 0, 0, 0, 0, 0, 0, 0.029, 0.1, 0.1, 0.1, 0.1,
+    0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1524, 0.2, 0.2, 0.2386,
+    0.3395, 0.4, 0.437, 0.5, 0.5287, 0.6225, 0.7, 0.7063, 0.7962, 0.8, 0.8941, 0.9,
+    0.9863, 1, 1.0729, 1.1, 1.1544, 1.2, 1.2504, 1.3, 1.3, 1.3, 1.3, 1.3163,
+    1.4, 1.4, 1.4, 1.4, 1.4017, 1.4846, 1.5, 1.5, 1.5748, 1.6, 1.6, 1.653,
+    1.7, 1.7, 1.7487, 1.8, 1.8341, 1.9, 1.9, 1.9229, 2, 2, 2, 2.1,
+    2.1, 2.1897, 2.2, 2.2, 2.2674, 2.3, 2.3, 2.3567, 2.4, 2.4, 2.4446, 2.5,
+    2.5262, 2.6, 2.6234, 2.7149, 2.8, 2.8038, 2.9011, 2.9969, 3.0913, 3.1845, 3.2762, 3.3757,
+    3.4649, 3.5617, 3.657, 3.751, 3.8, 3.8432, 3.9332, 4, 4, 4, 4.0121, 4.1,
+    4.1, 4.1, 4.0079, 4, 4, 4, 4, 3.9334, 3.9, 3.9, 3.9, 3.8541,
+    3.8, 3.8, 3.768, 3.7, 3.6761, 3.6, 3.6, 3.5927, 3.5, 3.5, 3.5, 3.5,
+    3.5, 3.5761, 3.6, 3.6, 3.6604, 3.7, 3.7514, 3.8, 3.8, 3.8349, 3.9, 3.9218,
+    4.0199, 4.1123, 4.2076, 4.3016, 4.3985, 4.6816, 5.0515, 5.4222, 5.8036, 6.1097, 6.4656, 6.8461,
+    7.3316, 7.9083, 8.4305, 8.9369, 9.5105, 10.0759, 10.6024, 11.0027, 11.4847, 12.0482, 12.5152, 12.8994,
+    13.2776, 13.7381, 14.1303, 14.5168, 14.8858, 15.273, 15.6547, 15.9731, 16.2596, 16.542, 16.7857, 17.0111,
+    17.2325, 17.3532, 17.522, 17.6, 17.6, 17.6, 17.6, 17.5044, 17.41, 17.3145, 17.2205, 17.1255,
+    17.0318, 16.9373, 16.784, 16.6459, 16.4536, 16.2578, 16.1234, 15.967, 15.8736, 15.7552, 15.566, 15.3879,
+    15.2881, 15.0958, 14.9064, 14.8099, 14.6287, 14.5201, 14.3477, 14.2307, 14.0709, 13.9399, 13.7916, 13.6514,
+    13.5552, 13.4604, 13.367, 13.2718, 13.1766, 13.0812, 12.9743, 12.7916, 12.6975, 12.602, 12.5078, 12.3247,
+    12.0547, 11.7686, 11.4154, 11.1009, 10.9385, 10.7344, 10.3998, 10.0163, 9.6382, 9.2957, 8.9799, 8.6248,
+    8.3404, 8.0424, 7.674, 7.3851, 7.0061, 6.5307, 6.1484, 5.7696, 5.4662, 5.1084, 4.7302, 4.3498,
+    3.971, 3.6455, 3.4075, 3.1343, 2.7917, 2.5376, 2.3484, 2.1585, 1.9849, 1.9107, 2, 2,
+    2, 2.0894, 2.1844, 2.2787, 2.374, 2.6057, 2.8265, 3.0161, 3.2057, 3.3954, 3.5851, 3.8122,
+    4.0967, 4.354, 4.5651, 4.8509, 5.1459, 5.5259, 5.9041, 6.1881, 6.5643, 6.8561, 7.1418, 7.4251,
+    7.7093, 8.0593, 8.3192, 8.4541, 8.5493, 8.6437, 8.7, 8.7336, 8.8, 8.8, 8.8, 8.8,
+    8.7926, 8.7, 8.7, 8.6079, 8.5133, 8.5, 8.4237, 8.1863, 7.968, 7.7786, 7.4219, 6.948,
+    6.4299, 5.8212, 5.1563, 4.4634, 3.7042, 2.8897, 1.9005, 1.2368, 0.5651, -0.2856, -0.8593, -2.9,
+]
+_FREE_FIELD = [v - 7 for v in _FREE_FIELD_RAW]
+
+
+def _iso226_init_normalize(freqs):
+    """Interpolated ISO 226:2003 loudness parameters at each frequency."""
+    par = []
+    ff = []
+    p_f, p_a, p_lu, p_tf = _ISO226_F, _ISO226_A_F, _ISO226_L_U, _ISO226_T_F
+    i = 0
+    n = len(p_f)
+    for f in freqs:
+        if i < n and f >= p_f[i]:
+            i += 1
+        i0 = max(0, i - 1)
+        i1 = min(i, n - 1)
+        if i0 == i1:
+            a, lu, tf = p_a[i0], p_lu[i0], p_tf[i0]
+        else:
+            l0, l1, lf = math.log(p_f[i0]), math.log(p_f[i1]), math.log(f)
+            frac = (lf - l0) / (l1 - l0)
+            a = p_a[i0] + frac * (p_a[i1] - p_a[i0])
+            lu = p_lu[i0] + frac * (p_lu[i1] - p_lu[i0])
+            tf = p_tf[i0] + frac * (p_tf[i1] - p_tf[i0])
+        m = a * (math.log10(4) - 10 + lu / 10)
+        k = (0.005076 / (10 ** m)) - (10 ** (a * tf / 10))
+        c = (10 ** (9.4 + 4 * m)) / len(freqs)
+        par.append((a, k, c))
+        ffi = math.floor(0.5 + 48 * math.log2(f / 19.4806))
+        ff.append(_FREE_FIELD[max(0, min(479, ffi))])
+    return par, ff
+
+
+def iso226_find_offset(curve, target_phon=0.0):
+    """dB offset that brings `curve` (list of (freq, dB)) to `target_phon` loudness."""
+    freqs = [f for f, _ in curve]
+    values = [v for _, v in curve]
+    par, ff = _iso226_init_normalize(freqs)
+    l10 = math.log(10) / 10
+
+    def get_step(offset):
+        v_total = 0.0
+        d_total = 0.0
+        for (a, k, c), fr_val, ff_val in zip(par, values, ff):
+            v0 = math.exp(l10 * (fr_val + offset - ff_val))
+            ds = l10 * v0
+            v1 = k + v0 ** a
+            ds *= a * (v0 ** (a - 1))
+            v_total += c * (v1 ** 4)
+            ds *= c * 4 * (v1 ** 3)
+            d_total += ds
+        return (math.log(v_total) - target_phon * l10) * (v_total / d_total)
+
+    x = 0.0
+    for _ in range(100):  # converges in a handful of steps; capped as a safety net
+        dx = get_step(x)
+        x -= dx
+        if abs(dx) <= 0.01:
+            break
+    return x
+
+
+def autoeq_loudness_normalize(curve):
+    """Shift `curve` by its own ISO-226 offset to 0 phon, matching hangout.audio."""
+    offset = iso226_find_offset(curve, 0.0)
+    return [(f, v + offset) for f, v in curve]
+
+
 # ===========================================================================
 # GUI helpers
 # ===========================================================================
@@ -1001,6 +1181,7 @@ class EqLoaderGUI(tk.Tk):
         self._autoeq_db_path = None
         self._autoeq_model_index = None
         self._autoeq_model_index_path = None
+        self._autoeq_target_index = None  # lazily fetched target-curve list
 
         self._build_widgets()
 
@@ -1545,7 +1726,7 @@ class EqLoaderGUI(tk.Tk):
         self.ax.xaxis.set_major_locator(ticker.LogLocator(base=10, numticks=10))
         self.ax.xaxis.set_major_formatter(ticker.FuncFormatter(freq_formatter))
 
-        # Set custom ticks to show only 20 Hz and 20 kHz (exclude 0 and 22 kHz)
+        # Set custom ticks to show only 20 Hz and 20 kHz (exclude 0)
         major_ticks = [20, 100, 1000, 10000, 20000]
         self.ax.set_xticks(major_ticks)
         self.ax.set_xticklabels([freq_formatter(t, None) for t in major_ticks])
@@ -2074,24 +2255,228 @@ class EqLoaderGUI(tk.Tk):
             messagebox.showerror("AutoEQ", f"Could not read measurement file:\n{e}")
             return
 
-        use_flat = messagebox.askyesno(
-            "AutoEQ Target",
-            "Use a flat (0 dB) target curve?\n\n"
-            "If you select 'No', you will be prompted to choose a target curve file (freq, dB per line).")
+        self._pick_autoeq_target(
+            lambda target_points: self._run_autoeq(measurement, target_points))
 
-        target_points = None
-        if not use_flat:
-            target_path = filedialog.askopenfilename(
-                title="Select Target Curve File (freq, dB per line)",
-                filetypes=[("Text/CSV files", "*.txt *.csv"), ("All files", "*.*")])
-            if not target_path:
-                return
+    def _pick_autoeq_target(self, callback):
+        """Ask flat vs. a target searched from AutoEQ's online library vs. a
+        local file. Eventually calls callback(target_points_or_None); None
+        means flat. Silently does nothing further if the user cancels.
+        """
+        choice = self._prompt_for_target_source()
+        if choice is None:
+            return
+        if choice == "flat":
+            callback(None)
+            return
+        if choice == "online":
+            def after_fetch():
+                path = self._show_target_search_dialog()
+                if not path:
+                    return
+                try:
+                    callback(parse_frequency_response_file(path))
+                except Exception as e:
+                    messagebox.showerror("AutoEQ", f"Could not read target file:\n{e}")
+            self._fetch_autoeq_targets(after_fetch)
+            return
+
+        # choice == "file"
+        target_path = filedialog.askopenfilename(
+            title="Select Target Curve File (freq, dB per line)",
+            filetypes=[("Text/CSV files", "*.txt *.csv"), ("All files", "*.*")])
+        if not target_path:
+            return
+        try:
+            callback(parse_frequency_response_file(target_path))
+        except Exception as e:
+            messagebox.showerror("AutoEQ", f"Could not read target file:\n{e}")
+
+    def _prompt_for_target_source(self):
+        """Ask 'flat' vs. 'online target library' vs. 'local file'. Returns
+        'flat'/'online'/'file'/None."""
+        dlg = tk.Toplevel(self)
+        dlg.title("AutoEQ Target")
+        dlg.configure(bg=THEME["chassis"])
+        dlg.transient(self)
+        dlg.resizable(False, False)
+
+        ttk.Label(dlg, wraplength=380, justify="left", text=(
+            "Choose the target curve AutoEQ should reshape your measurement "
+            "towards."
+        )).pack(padx=24, pady=(20, 16))
+
+        result = {"choice": None}
+        row = ttk.Frame(dlg)
+        row.pack(padx=16, pady=(0, 18))
+
+        def choose(c):
+            result["choice"] = c
+            dlg.destroy()
+
+        ttk.Button(row, text="Flat (0 dB)", command=lambda: choose("flat")).pack(
+            side="left", padx=4)
+        ttk.Button(row, text="Search AutoEQ Targets...", style="Accent.TButton",
+                   command=lambda: choose("online")).pack(side="left", padx=4)
+        ttk.Button(row, text="Load Target File...",
+                   command=lambda: choose("file")).pack(side="left", padx=4)
+        ttk.Button(row, text="Cancel", command=lambda: choose(None)).pack(
+            side="left", padx=4)
+
+        dlg.bind("<Escape>", lambda _e: choose(None))
+        dlg.protocol("WM_DELETE_WINDOW", lambda: choose(None))
+        dlg.grab_set()
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        self.wait_window(dlg)
+        return result["choice"]
+
+    def _fetch_autoeq_targets(self, on_ready):
+        """Fetch (and memoize for this session) AutoEQ's target-curve list."""
+        if self._autoeq_target_index is not None:
+            on_ready()
+            return
+
+        busy = self._show_busy_dialog(
+            "AutoEQ Targets", "Fetching target curve list from GitHub...")
+
+        def task():
+            print("Fetching AutoEQ target curve list from GitHub...")
             try:
-                target_points = parse_frequency_response_file(target_path)
+                index = fetch_autoeq_targets_index()
             except Exception as e:
-                messagebox.showerror("AutoEQ", f"Could not read target file:\n{e}")
+                def fail():
+                    busy.destroy()
+                    messagebox.showerror(
+                        "AutoEQ Targets", f"Could not fetch the target list:\n{e}")
+                self.after(0, fail)
                 return
 
+            print(f"Fetched {len(index)} target curve(s).")
+
+            def apply():
+                busy.destroy()
+                self._autoeq_target_index = index
+                on_ready()
+            self.after(0, apply)
+
+        self._run_bg(task)
+
+    def _show_target_search_dialog(self):
+        c = THEME
+        dlg = tk.Toplevel(self)
+        dlg.title("Search AutoEQ Targets")
+        dlg.configure(bg=c["chassis"])
+        dlg.transient(self)
+        dlg.geometry("620x440")
+        dlg.minsize(560, 340)
+
+        result = {"path": None}
+        filtered = []
+
+        top = ttk.Frame(dlg)
+        top.pack(fill="x", padx=12, pady=(12, 6))
+        ttk.Label(top, text="Search:").pack(side="left")
+        search_var = tk.StringVar()
+        entry = ttk.Entry(top, textvariable=search_var)
+        entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+        list_frame = ttk.Frame(dlg)
+        list_frame.pack(fill="both", expand=True, padx=12, pady=6)
+        listbox = tk.Listbox(
+            list_frame, bg=c["panel"], fg=c["ink"],
+            selectbackground=c["accent"], selectforeground=c["chassis"],
+            highlightthickness=1, highlightbackground=c["line"],
+            borderwidth=0, activestyle="none", font=(self.font_ui, 10))
+        listbox.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        listbox.configure(yscrollcommand=scrollbar.set)
+
+        status_var = tk.StringVar()
+        ttk.Label(dlg, textvariable=status_var, style="Muted.TLabel").pack(
+            anchor="w", padx=12)
+
+        def refresh_list(*_args):
+            query = search_var.get().strip().lower()
+            listbox.delete(0, "end")
+            nonlocal filtered
+            if query:
+                terms = query.split()
+                filtered = [
+                    e for e in self._autoeq_target_index
+                    if all(t in e["label"].lower() for t in terms)
+                ]
+            else:
+                filtered = list(self._autoeq_target_index)
+            for e in filtered[:300]:
+                listbox.insert("end", e["label"])
+            status_var.set(
+                f"{len(filtered)} match(es)"
+                + (" (showing first 300)" if len(filtered) > 300 else ""))
+
+        def choose(_event=None):
+            sel = listbox.curselection()
+            if not sel or sel[0] >= len(filtered):
+                return
+            entry_data = filtered[sel[0]]
+
+            select_btn.configure(state="disabled")
+            status_var.set(f"Downloading {entry_data['label']}...")
+
+            def task():
+                try:
+                    local_path = fetch_autoeq_remote_file(entry_data["path"])
+                except Exception as e:
+                    def fail():
+                        messagebox.showerror(
+                            "AutoEQ", f"Could not download target:\n{e}")
+                        select_btn.configure(state="normal")
+                        refresh_list()
+                    self.after(0, fail)
+                    return
+
+                def done():
+                    result["path"] = local_path
+                    dlg.destroy()
+                self.after(0, done)
+
+            self._run_bg(task)
+
+        def cancel():
+            dlg.destroy()
+
+        search_var.trace_add("write", refresh_list)
+        listbox.bind("<Double-Button-1>", choose)
+        entry.bind("<Return>", lambda _e: choose() if filtered else None)
+        entry.bind("<Down>", lambda _e: (listbox.focus_set(), listbox.selection_set(0)))
+        dlg.bind("<Escape>", lambda _e: cancel())
+
+        row = ttk.Frame(dlg)
+        row.pack(fill="x", padx=12, pady=(6, 12))
+        ttk.Button(row, text="Cancel", command=cancel).pack(side="right", padx=4)
+        select_btn = ttk.Button(row, text="Select", style="Accent.TButton", command=choose)
+        select_btn.pack(side="right", padx=4)
+
+        refresh_list()
+        if filtered:
+            listbox.selection_set(0)
+
+        dlg.protocol("WM_DELETE_WINDOW", cancel)
+        dlg.grab_set()
+        entry.focus_set()
+
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dlg.winfo_height()) // 3
+        dlg.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+        self.wait_window(dlg)
+        return result["path"]
+
+    def _run_autoeq(self, measurement, target_points):
         max_filters = self._parse_int(self.max_filter_entry.get(), DEFAULT_MAX_FILTERS)
 
         busy = self._show_busy_dialog(
@@ -2107,6 +2492,14 @@ class EqLoaderGUI(tk.Tk):
                 fr_target = (
                     [(f, 0.0) for f in freqs] if target_points is None
                     else autoeq_interp(freqs, target_points))
+
+                # Loudness-normalize both curves before comparing them (matches
+                # hangout.audio's pipeline): otherwise two curves that each use
+                # a different absolute dB reference convention — as different
+                # measurement sources/rigs do — get compared directly, and the
+                # optimizer chases a systematic level offset instead of shape.
+                fr = autoeq_loudness_normalize(fr)
+                fr_target = autoeq_loudness_normalize(fr_target)
 
                 filters = autoeq_run(fr, fr_target, max_filters)
                 fr_eq = autoeq_apply(fr, filters)
