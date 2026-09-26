@@ -35,10 +35,12 @@ sudo python3 eqloader.py
 ### Starting up
 
 ```
-python3 eqloader.py
+python3 eqloader.py [--graph-no-hide | --no-graph]
 ```
 
 Plug in your dongle, then click **Refresh List** — it will appear in the Device list at the top. Select it to target it for all push/pull operations. If you have multiple Walkplay devices, pick the right one or set the PID field manually.
+
+The frequency-response graph is shown by default and hides automatically when the window is too short to use it precisely. Pass `--graph-no-hide` to keep it visible at all times, or `--no-graph` to always hide it (useful in small or tiling windows).
 
 ### Building an EQ from scratch
 
@@ -72,9 +74,18 @@ Use the **PEQ Enable / Disable** row to turn the hardware EQ on or off for a giv
 | Ctrl+Z | Undo |
 | Ctrl+Y / Ctrl+Shift+Z | Redo |
 
-## CLI
+## CLI & flags
 
 All GUI features are also available headlessly, useful for scripting or automation, or embedding EQ Profiles into your Desktop Environment.
+
+### GUI flags
+
+| Flag | Description |
+|---|---|
+| `--graph-no-hide` | Always show the frequency-response graph |
+| `--no-graph` | Always hide the frequency-response graph |
+
+Without either flag the graph is shown normally and hides automatically when the window becomes too small to interact with.
 
 ### Push a profile to the device
 

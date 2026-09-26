@@ -847,8 +847,11 @@ class StdoutRedirector:
 
 class EqLoaderGUI(tk.Tk):
 
-    def __init__(self):
+    def __init__(self, graph=None):
         super().__init__()
+
+        # None = auto (hide when <150 px), True = always show, False = always hide
+        self._graph_forced = graph
 
         self.title("Walkplay PEQ Loader")
 
@@ -882,6 +885,9 @@ class EqLoaderGUI(tk.Tk):
         self._drag_snapshot_taken = False
 
         self._build_widgets()
+
+        if self._graph_forced is False:
+            self._set_graph_visible(False)
 
         self._theme_classic_widgets()
 
@@ -1263,6 +1269,14 @@ class EqLoaderGUI(tk.Tk):
         self.canvas_graph.mpl_connect("button_release_event", self._on_release)
         self.canvas_graph.get_tk_widget().pack(fill="both", expand=True)
 
+        self._graph_too_small_label = tk.Label(
+            graph_frame,
+            text="Window too small to display graph",
+            bg=THEME["chassis"],
+            fg=THEME.get("muted", "#666666"),
+            font=("TkDefaultFont", 9),
+        )
+
         # --------------------------------------------------------------
         # Filter list + editor  (row 3, col 0)
         # --------------------------------------------------------------
@@ -1445,9 +1459,10 @@ class EqLoaderGUI(tk.Tk):
 
         for i, (text, cmd, style) in enumerate(_action_btns):
             actions.rowconfigure(i, weight=1)
-            ttk.Button(
-                actions, text=text, command=cmd, style=style,
-            ).grid(row=i, column=0, sticky="nsew", padx=6, pady=2)
+            btn = ttk.Button(actions, text=text, command=cmd, style=style)
+            btn.grid(row=i, column=0, sticky="nsew", padx=6, pady=2)
+            if text == "Reload Graph":
+                self._reload_graph_btn = btn
 
         # --------------------------------------------------------------
         # Initial state
@@ -1467,12 +1482,23 @@ class EqLoaderGUI(tk.Tk):
     # Window resize
     # ==================================================================
 
-    def _on_graph_frame_resize(self, event):
+    def _set_graph_visible(self, visible):
         canvas_widget = self.canvas_graph.get_tk_widget()
-        if event.height < 150:
+        if visible:
+            self._graph_too_small_label.pack_forget()
+            if not canvas_widget.winfo_ismapped():
+                canvas_widget.pack(fill="both", expand=True)
+            self._reload_graph_btn.grid()
+        else:
             canvas_widget.pack_forget()
-        elif not canvas_widget.winfo_ismapped():
-            canvas_widget.pack(fill="both", expand=True)
+            if self._graph_forced is None:
+                self._graph_too_small_label.pack(expand=True)
+            self._reload_graph_btn.grid_remove()
+
+    def _on_graph_frame_resize(self, event):
+        if self._graph_forced is not None:
+            return
+        self._set_graph_visible(event.height >= 150)
 
     # ==================================================================
     # Create / Editor
@@ -2662,6 +2688,15 @@ def _build_parser():
         prog="eqloader",
         description="Walkplay PEQ loader — run without arguments to open the GUI.",
     )
+    graph_grp = p.add_mutually_exclusive_group()
+    graph_grp.add_argument(
+        "--graph-no-hide", dest="graph", action="store_true", default=None,
+        help="Always show the frequency-response graph (GUI only)",
+    )
+    graph_grp.add_argument(
+        "--no-graph", dest="graph", action="store_false",
+        help="Always hide the frequency-response graph (GUI only)",
+    )
     sub = p.add_subparsers(dest="cmd")
 
     # ---- push ----
@@ -2709,5 +2744,5 @@ if __name__ == "__main__":
     elif args.cmd == "list":
         _cli_list(args)
     else:
-        app = EqLoaderGUI()
+        app = EqLoaderGUI(graph=args.graph)
         app.mainloop()
