@@ -626,10 +626,14 @@ class EqLoaderGUI(tk.Tk):
 
         btn_frame = ttk.Frame(dev_frame)
         btn_frame.pack(side="left", padx=6)
-        ttk.Button(btn_frame, text="Refresh List",
-                   command=self._refresh_devices).pack(fill="x", pady=2)
-        ttk.Button(btn_frame, text="Get Slot / Version",
-                   command=self._get_slot).pack(fill="x", pady=2)
+        refresh_btn = ttk.Button(btn_frame, text="Refresh List",
+                                 command=self._refresh_devices)
+        refresh_btn.pack(fill="x", pady=2)
+        self._add_tooltip(refresh_btn, "F5")
+        slot_btn = ttk.Button(btn_frame, text="Get Slot / Version",
+                              command=self._get_slot)
+        slot_btn.pack(fill="x", pady=2)
+        self._add_tooltip(slot_btn, "Ctrl+G")
 
         # ---- VID / PID (row 1) ----
         override_frame = ttk.Frame(self)
@@ -737,10 +741,14 @@ class EqLoaderGUI(tk.Tk):
         self.ed_slot_spin = ttk.Spinbox(ed_frame, from_=0, to=15, width=5)
         self.ed_slot_spin.set(0)
         self.ed_slot_spin.pack(side="left", padx=(0, 8))
-        ttk.Button(ed_frame, text="Enable PEQ", command=self._enable,
-                   style="Accent.TButton").pack(side="left", padx=4, pady=4)
-        ttk.Button(ed_frame, text="Disable PEQ", command=self._disable,
-                   style="Danger.TButton").pack(side="left", padx=4, pady=4)
+        enable_btn = ttk.Button(ed_frame, text="Enable PEQ", command=self._enable,
+                                style="Accent.TButton")
+        enable_btn.pack(side="left", padx=4, pady=4)
+        self._add_tooltip(enable_btn, "Ctrl+Shift+E")
+        disable_btn = ttk.Button(ed_frame, text="Disable PEQ", command=self._disable,
+                                 style="Danger.TButton")
+        disable_btn.pack(side="left", padx=4, pady=4)
+        self._add_tooltip(disable_btn, "Ctrl+Shift+X")
 
         # ---- Log (row 5, col 0) ----
         log_frame = ttk.LabelFrame(self, text="Log")
@@ -754,19 +762,24 @@ class EqLoaderGUI(tk.Tk):
         actions.columnconfigure(0, weight=1)
 
         action_btns = (
-            ("Reload Graph", self._create_apply, "Accent.TButton"),
-            ("Add Band", self._create_add_band, "TButton"),
-            ("Delete Band", self._create_delete_band, "Danger.TButton"),
-            ("Delete All", self._create_delete_all_bands, "Danger.TButton"),
-            ("Load EQ from Device", self._create_load_from_device, "TButton"),
-            ("Save Profile to File", self._create_save_profile, "TButton"),
-            ("Load Profile from File", self._create_load_profile, "TButton"),
-            ("Push EQ to Device", self._create_push, "Accent.TButton"),
+            ("Reload Graph", self._create_apply, "Accent.TButton", "Ctrl+R", "<Control-r>"),
+            ("Add Band", self._create_add_band, "TButton", "Ctrl+B", "<Control-b>"),
+            ("Delete Band", self._create_delete_band, "Danger.TButton", "Ctrl+D", "<Control-d>"),
+            ("Delete All", self._create_delete_all_bands, "Danger.TButton",
+             "Ctrl+Shift+D", "<Control-Shift-D>"),
+            ("Load EQ from Device", self._create_load_from_device, "TButton",
+             "Ctrl+E", "<Control-e>"),
+            ("Save Profile to File", self._create_save_profile, "TButton", "Ctrl+S", "<Control-s>"),
+            ("Load Profile from File", self._create_load_profile, "TButton",
+             "Ctrl+O", "<Control-o>"),
+            ("Push EQ to Device", self._create_push, "Accent.TButton", "Ctrl+P", "<Control-p>"),
         )
-        for i, (text, cmd, style) in enumerate(action_btns):
+        for i, (text, cmd, style, accel, seq) in enumerate(action_btns):
             actions.rowconfigure(i, weight=1)
             btn = ttk.Button(actions, text=text, command=cmd, style=style)
             btn.grid(row=i, column=0, sticky="nsew", padx=6, pady=2)
+            self.bind(seq, lambda _e, c=cmd: c())
+            self._add_tooltip(btn, accel)
             if text == "Reload Graph":
                 self._reload_graph_btn = btn
 
@@ -775,6 +788,10 @@ class EqLoaderGUI(tk.Tk):
         self.bind("<Control-z>", self._undo)
         self.bind("<Control-y>", self._redo)
         self.bind("<Control-Shift-z>", self._redo)
+        self.bind("<F5>", lambda _e: self._refresh_devices())
+        self.bind("<Control-g>", lambda _e: self._get_slot())
+        self.bind("<Control-Shift-E>", lambda _e: self._enable())
+        self.bind("<Control-Shift-X>", lambda _e: self._disable())
 
         self._refresh_create_tab()
         self._refresh_devices()
@@ -1391,6 +1408,36 @@ class EqLoaderGUI(tk.Tk):
         self.vid_entry.insert(0, f"0x{d['vendor_id']:04X}")
         self.pid_entry.delete(0, "end")
         self.pid_entry.insert(0, f"0x{d['product_id']:04X}")
+
+    # ------------------------------------------------------------------
+    # Tooltips
+    # ------------------------------------------------------------------
+
+    def _add_tooltip(self, widget, text):
+        """Show a small hover tooltip (used for keyboard-shortcut hints)."""
+        state = {"win": None}
+
+        def show(_e=None):
+            if state["win"] is not None or not text:
+                return
+            x = widget.winfo_rootx() + 10
+            y = widget.winfo_rooty() + widget.winfo_height() + 4
+            win = tk.Toplevel(self)
+            win.wm_overrideredirect(True)
+            win.wm_geometry(f"+{x}+{y}")
+            tk.Label(win, text=text, bg=THEME["input"], fg=THEME["ink"],
+                     font=(self.font_ui, 9), padx=6, pady=2,
+                     highlightthickness=1, highlightbackground=THEME["line"]).pack()
+            state["win"] = win
+
+        def hide(_e=None):
+            if state["win"] is not None:
+                state["win"].destroy()
+                state["win"] = None
+
+        widget.bind("<Enter>", show, add="+")
+        widget.bind("<Leave>", hide, add="+")
+        widget.bind("<Destroy>", hide, add="+")
 
     # ------------------------------------------------------------------
     # Lifecycle

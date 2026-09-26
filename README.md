@@ -69,10 +69,24 @@ Use the **PEQ Enable / Disable** row to turn the hardware EQ on or off for a giv
 
 ### Keyboard shortcuts
 
+Every action has a keyboard shortcut (also shown on the buttons themselves):
+
 | Shortcut | Action |
 |---|---|
 | Ctrl+Z | Undo |
 | Ctrl+Y / Ctrl+Shift+Z | Redo |
+| Ctrl+R | Reload Graph |
+| Ctrl+B | Add Band |
+| Ctrl+D | Delete Band |
+| Ctrl+Shift+D | Delete All Bands |
+| Ctrl+E | Load EQ from Device |
+| Ctrl+S | Save Profile to File |
+| Ctrl+O | Load Profile from File |
+| Ctrl+P | Push EQ to Device |
+| F5 | Refresh Device List |
+| Ctrl+G | Get Slot / Version |
+| Ctrl+Shift+E | Enable PEQ |
+| Ctrl+Shift+X | Disable PEQ |
 
 ## CLI & flags
 
