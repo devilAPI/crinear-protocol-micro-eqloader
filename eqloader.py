@@ -1245,7 +1245,8 @@ class EqLoaderGUI(tk.Tk):
         # Container frame: grid_propagate(False) stops the canvas's own
         # size requests from forcing a main-window geometry recalculation
         # when matplotlib redraws on click.
-        graph_frame = tk.Frame(self, bg=THEME["chassis"])
+        self.graph_frame = tk.Frame(self, bg=THEME["chassis"])
+        graph_frame = self.graph_frame
         graph_frame.grid(
             row=2,
             column=0,
@@ -1452,6 +1453,8 @@ class EqLoaderGUI(tk.Tk):
         # Initial state
         # --------------------------------------------------------------
 
+        self.graph_frame.bind("<Configure>", self._on_graph_frame_resize)
+
         self.bind("<Control-z>", self._undo)
         self.bind("<Control-y>", self._redo)
         self.bind("<Control-Shift-z>", self._redo)
@@ -1459,6 +1462,17 @@ class EqLoaderGUI(tk.Tk):
         self._refresh_create_tab()
 
         self._refresh_devices()
+
+    # ==================================================================
+    # Window resize
+    # ==================================================================
+
+    def _on_graph_frame_resize(self, event):
+        canvas_widget = self.canvas_graph.get_tk_widget()
+        if event.height < 150:
+            canvas_widget.pack_forget()
+        elif not canvas_widget.winfo_ismapped():
+            canvas_widget.pack(fill="both", expand=True)
 
     # ==================================================================
     # Create / Editor
