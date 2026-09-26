@@ -302,7 +302,7 @@ def pull_from_device(dev, max_filters, slot_hint=-1, timeout=10.0):
 
     while len(filters) < max_filters and time.time() < deadline:
         data = _read_report(dev, timeout_ms=200)
-        if data is None or len(data) < 32 or data[1] != CMD["PEQ_VALUES"]:
+        if data is None or len(data) < 34 or data[1] != CMD["PEQ_VALUES"]:
             continue
         parsed = parse_filter_packet(data)
         filters[parsed["filterIndex"]] = parsed
@@ -473,6 +473,8 @@ class EqLoaderGUI(tk.Tk):
         self.after(150, self._check_initial_graph_visibility)
         self._theme_classic_widgets()
         self._poll_log_queue()
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         if hid is None:
             self._log("ERROR: the 'hidapi' package is not installed.\n"
@@ -1389,6 +1391,14 @@ class EqLoaderGUI(tk.Tk):
         self.vid_entry.insert(0, f"0x{d['vendor_id']:04X}")
         self.pid_entry.delete(0, "end")
         self.pid_entry.insert(0, f"0x{d['product_id']:04X}")
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def _on_close(self):
+        if messagebox.askyesno("Quit", "Do you really want to leave this application?"):
+            self.destroy()
 
     # ------------------------------------------------------------------
     # Logging
