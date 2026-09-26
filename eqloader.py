@@ -1065,7 +1065,7 @@ class EqLoaderGUI(tk.Tk):
             highlightcolor=c["accent"],
             borderwidth=0,
             activestyle="none",
-            font=(self.font_mono, 10),
+            font=(self.font_ui, 10),
         )
         for lb in (getattr(self, "device_list", None),
                    getattr(self, "filter_list", None)):
